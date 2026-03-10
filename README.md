@@ -211,6 +211,142 @@ python train.py configs/gmflow_checkerboard_k64.py --gpu-ids 0
 
 This full trainer is not optimized for the simple 2D checkerboard dataset, so GPU usage may be inefficient.
 
+## GMFlow 3D: Brain MRI Generation Conditioned on Age
+
+This repository extends GMFlow to **3D volumetric brain MRI generation** using the [OpenBHB](https://ieee-dataport.org/open-access/openbhb-multi-site-brain-mri-dataset-age-prediction-and-debiasing) dataset, conditioned on continuous age (6–86 years).
+
+### Key Differences from 2D GMFlow
+
+- Operates on 5D tensors `(bs, C, D, H, W)` instead of 4D `(bs, C, H, W)`
+- `PatchEmbed3D` using `Conv3d` → 4096 tokens for 64³ volumes with patch_size=4
+- `AgeEmbedding` for continuous age conditioning (replaces discrete class labels)
+- No VAE — works directly in voxel space at 64×64×64 resolution
+- No spectral loss component (SpectrumMLP uses FFT2D)
+- GM gaussian dimension at `-5` instead of `-4`
+
+### Data Preparation
+
+1. Download the OpenBHB dataset and place raw `.npy` volumes under `data/openbhb/train/quasiraw_3d/` along with `metadata.tsv`.
+
+2. Preprocess volumes (downsample to 64³, normalize to [-1, 1]):
+
+```bash
+python tools/prepare_openbhb.py \
+    --data_root data/openbhb/train/quasiraw_3d \
+    --metadata data/openbhb/train/quasiraw_3d/metadata.tsv \
+    --output_dir data/openbhb/train_cache_64 \
+    --target_shape 64 64 64
+```
+
+### Training
+
+The standalone training script requires **no mmcv/mmgen** — only PyTorch and diffusers:
+
+```bash
+python tools/train_standalone.py \
+    --cache_dir data/openbhb/train_cache_64 \
+    --metadata data/openbhb/train/quasiraw_3d/metadata.tsv \
+    --work_dir work_dirs/gmflow3d_openbhb
+```
+
+For GPUs with limited VRAM (e.g., 12GB RTX 3060):
+
+```bash
+python tools/train_standalone.py \
+    --cache_dir data/openbhb/train_cache_64 \
+    --metadata data/openbhb/train/quasiraw_3d/metadata.tsv \
+    --num_layers 8 --num_heads 8 --head_dim 64 \
+    --batch_size 1 --grad_accum 8 \
+    --work_dir work_dirs/gmflow3d_openbhb
+```
+
+Key options:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--num_layers` | 12 | Transformer depth |
+| `--num_heads` | 12 | Attention heads |
+| `--head_dim` | 64 | Head dimension (inner_dim = heads × head_dim) |
+| `--batch_size` | 2 | Per-GPU batch size |
+| `--grad_accum` | 4 | Gradient accumulation steps |
+| `--autocast_dtype` | bfloat16 | AMP dtype (`--no_amp` to disable) |
+| `--use_ema` / `--no_ema` | enabled | Exponential moving average |
+| `--resume` | — | Resume from checkpoint |
+
+TensorBoard logs are saved to `{work_dir}/tb/`:
+
+```bash
+tensorboard --logdir work_dirs/gmflow3d_openbhb/tb
+```
+
+### Inference
+
+Generate brain MRI volumes for specific ages:
+
+```bash
+python tools/inference.py \
+    --checkpoint work_dirs/gmflow3d_openbhb/checkpoints/latest.pt \
+    --ages 10 25 50 75 \
+    --output_dir output/samples
+```
+
+With classifier-free guidance and EMA weights:
+
+```bash
+python tools/inference.py \
+    --checkpoint work_dirs/gmflow3d_openbhb/checkpoints/latest.pt \
+    --ages 20 40 60 80 \
+    --guidance_scale 0.04 \
+    --use_ema \
+    --num_samples 5 \
+    --output_dir output/samples_cfg
+```
+
+Output formats: `.npy` (default), `.nii.gz` (NIfTI, requires nibabel), `.png` (center slices).
+
+### Visualization
+
+```bash
+# Grid of center slices (axial, coronal, sagittal) for all generated volumes:
+python tools/visualize.py output/samples/
+
+# Interactive 3D slice explorer with sliders:
+python tools/visualize.py output/samples/age050.0_seed42.npy --interactive
+
+# Axial slice montage:
+python tools/visualize.py output/samples/age050.0_seed42.npy --montage
+
+# Compare real vs generated:
+python tools/visualize.py \
+    --real data/openbhb/train_cache_64/100053248969.pt \
+    --generated output/samples/age025.0_seed42.npy
+
+# Voxel intensity histograms:
+python tools/visualize.py output/samples/ --histogram
+
+# Save without displaying:
+python tools/visualize.py output/samples/ --save figure.png --no_show
+```
+
+### 3D Architecture
+
+| Component | File |
+|-----------|------|
+| PatchEmbed3D, AgeEmbedding, GMOutput3D, GMDiTTransformer3D | [lib/models/architecture/gmflow3d.py](lib/models/architecture/gmflow3d.py) |
+| GMFlow3D diffusion (training + sampling) | [lib/models/diffusions/gmflow3d.py](lib/models/diffusions/gmflow3d.py) |
+| 3D GM operations (gm_to_mean, gm_to_sample, etc.) | [lib/ops/gmflow_ops/gmflow_ops_3d.py](lib/ops/gmflow_ops/gmflow_ops_3d.py) |
+| GMFlowNLLLoss3D | [lib/models/losses/diffusion_loss.py](lib/models/losses/diffusion_loss.py) |
+| OpenBHB dataset | [lib/datasets/openbhb.py](lib/datasets/openbhb.py) |
+| Standalone training (no mmcv) | [tools/train_standalone.py](tools/train_standalone.py) |
+| Inference | [tools/inference.py](tools/inference.py) |
+| Visualization | [tools/visualize.py](tools/visualize.py) |
+| Data preprocessing | [tools/prepare_openbhb.py](tools/prepare_openbhb.py) |
+| Smoke tests | [test_3d_smoke.py](test_3d_smoke.py) |
+
+---
+
+## GM-DiT ImageNet 256×256 (Original 2D)
+
 ## Essential Code
 
 - Training

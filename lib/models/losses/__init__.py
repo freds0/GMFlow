@@ -1,3 +1,3 @@
-from .diffusion_loss import DDPMMSELossMod, FlowNLLLoss, GMFlowNLLLoss
+from .diffusion_loss import DDPMMSELossMod, FlowNLLLoss, GMFlowNLLLoss, GMFlowNLLLoss3D
 
-__all__ = ['DDPMMSELossMod', 'FlowNLLLoss', 'GMFlowNLLLoss']
+__all__ = ['DDPMMSELossMod', 'FlowNLLLoss', 'GMFlowNLLLoss', 'GMFlowNLLLoss3D']

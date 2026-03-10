@@ -4,6 +4,7 @@ git+https://github.com/huggingface/diffusers.git@57084dacc5275d7212513b24837b60a
 transformers
 torchsde
 tensorboard
+wandb
 setuptools
 apex==0.9.10dev
 bitsandbytes

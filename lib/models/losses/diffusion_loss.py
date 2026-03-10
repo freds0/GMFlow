@@ -37,6 +37,29 @@ def gaussian_mixture_nll_loss(
     return loss
 
 
+@weighted_loss
+def gaussian_mixture_nll_loss_3d(
+        pred_means, target, pred_logstds, pred_logweights, eps=1e-4):
+    """GM NLL loss for 3D volumes.
+
+    Args:
+        pred_means (torch.Tensor): Shape (bs, *, num_gaussians, c, d, h, w)
+        target (torch.Tensor): Shape (bs, *, c, d, h, w)
+        pred_logstds (torch.Tensor): Shape (bs, *, 1, 1, 1, 1, 1) broadcastable
+        pred_logweights (torch.Tensor): Shape (bs, *, num_gaussians, 1, d, h, w)
+
+    Returns:
+        torch.Tensor: Shape (bs, *, d, h, w)
+    """
+    inverse_std = torch.exp(-pred_logstds).clamp(max=1 / eps)
+    diff_weighted = (pred_means - target.unsqueeze(-5)) * inverse_std
+    # sum over channels (dim=-4 for 3D: K, C, d, h, w -> sum C)
+    gaussian_ll = (-0.5 * diff_weighted.square() - pred_logstds).sum(dim=-4)
+    # gaussian_ll: (bs, *, num_gaussians, d, h, w)
+    loss = -torch.logsumexp(gaussian_ll + pred_logweights.squeeze(-4), dim=-4)
+    return loss
+
+
 class DDPMLossMod(DDPMLoss):
 
     def __init__(self,
@@ -359,5 +382,67 @@ class GMFlowNLLLoss(FlowNLLLoss):
 
             # update log_vars of this class
             self.collect_log(_loss, _var, timesteps=timesteps)  # Mod: log after rescaling
+
+        return reduce_loss(loss_rescaled, self.reduction)
+
+
+@MODULES.register_module()
+class GMFlowNLLLoss3D(FlowNLLLoss):
+    """GM NLL loss adapted for 3D volumes (bs, K, C, D, H, W)."""
+
+    _default_data_info = dict(
+        pred_means='means',
+        target='u_t',
+        pred_logstds='logstds',
+        pred_logweights='logweights')
+
+    def __init__(self,
+                 weight_scale=1.0,
+                 log_cfgs=None,
+                 data_info=None,
+                 reduction='mean',
+                 loss_name='loss_ddpm_nll'):
+        super().__init__(
+            weight_scale=weight_scale,
+            log_cfgs=log_cfgs,
+            reduction=reduction,
+            loss_name=loss_name)
+        self.data_info = self._default_data_info \
+            if data_info is None else data_info
+        self.loss_fn = partial(gaussian_mixture_nll_loss_3d, reduction='flatmean')
+        if log_cfgs is not None and log_cfgs.get('type', None) == 'quartile':
+            for i in range(4):
+                self.register_buffer(f'loss_quartile_{i}', torch.zeros((1,), dtype=torch.float))
+                self.register_buffer(f'var_quartile_{i}', torch.ones((1,), dtype=torch.float))
+                self.register_buffer(f'count_quartile_{i}', torch.zeros((1,), dtype=torch.long))
+
+    def forward(self, *args, **kwargs):
+        if len(args) == 1:
+            assert isinstance(args[0], dict)
+            output_dict = args[0]
+        elif 'output_dict' in kwargs:
+            assert len(args) == 0
+            output_dict = kwargs.pop('outputs_dict')
+        else:
+            raise NotImplementedError(
+                'Cannot parsing your arguments passed to this loss module.')
+
+        assert 'timesteps' in output_dict
+
+        timesteps = output_dict['timesteps']
+        loss = self._forward_loss(output_dict)
+
+        loss_rescaled = loss * self.weight_scale
+
+        with torch.no_grad():
+            weights = output_dict['logweights'].exp()
+            # 3D: sum over gaussian dim -5
+            mean = (weights * output_dict['means']).sum(-5, keepdim=True)
+            var = (weights * ((output_dict['means'] - mean).square()
+                              + (output_dict['logstds'] * 2).exp())).sum(-5)
+            _var = var.flatten(1).mean(dim=1)
+            _loss = loss
+
+            self.collect_log(_loss, _var, timesteps=timesteps)
 
         return reduce_loss(loss_rescaled, self.reduction)

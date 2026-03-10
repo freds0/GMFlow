@@ -1,5 +1,6 @@
 from .builder import build_dataloader
 from .imagenet import ImageNet
 from .checkerboard import CheckerboardData
+from .openbhb import OpenBHB
 
-__all__ = ['build_dataloader', 'ImageNet', 'CheckerboardData']
+__all__ = ['build_dataloader', 'ImageNet', 'CheckerboardData', 'OpenBHB']
