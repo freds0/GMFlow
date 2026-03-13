@@ -204,10 +204,14 @@ def mock_framework():
 # ---------------------------------------------------------------------------
 
 class OpenBHBSimple(Dataset):
-    """OpenBHB dataset that loads cached .pt volumes + age from metadata."""
+    """OpenBHB dataset that loads cached .pt volumes + age from metadata.
+
+    Supports both the per-split metadata.tsv (columns: participant_id, age)
+    and the full dataset train.tsv (columns: participant_id, split, sex, age, ...).
+    """
 
     def __init__(self, cache_dir, metadata_path, age_min=6.0, age_max=86.0,
-                 random_flip=True, negative_age=-1.0):
+                 random_flip=True, negative_age=-1.0, split=None):
         self.cache_dir = cache_dir
         self.age_min = age_min
         self.age_range = age_max - age_min
@@ -215,6 +219,10 @@ class OpenBHBSimple(Dataset):
         self.negative_age = negative_age
 
         metadata = pd.read_csv(metadata_path, sep='\t')
+        if split and 'split' in metadata.columns:
+            metadata = metadata[metadata['split'] == split]
+            print(f'Filtered to split={split}: {len(metadata)} rows')
+
         self.subjects = []
         for _, row in metadata.iterrows():
             pid = str(row['participant_id'])
@@ -534,7 +542,8 @@ def train(args):
     dataset = OpenBHBSimple(
         cache_dir=args.cache_dir,
         metadata_path=args.metadata,
-        random_flip=True)
+        random_flip=True,
+        split=args.split)
 
     dataloader = DataLoader(
         dataset,
@@ -726,7 +735,10 @@ def main():
     parser.add_argument('--cache_dir', type=str, required=True,
                         help='Directory with preprocessed .pt volumes')
     parser.add_argument('--metadata', type=str, required=True,
-                        help='Path to metadata.tsv')
+                        help='Path to metadata.tsv or train.tsv')
+    parser.add_argument('--split', type=str, default=None,
+                        help='Filter by split column (e.g. "train"). '
+                             'Only needed when metadata has a split column.')
 
     # Model architecture
     parser.add_argument('--num_gaussians', type=int, default=4)

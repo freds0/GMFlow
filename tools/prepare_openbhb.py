@@ -34,7 +34,8 @@ def main():
     parser.add_argument('--data_root', type=str,
                         default='data/openbhb/train/quasiraw_3d')
     parser.add_argument('--metadata', type=str,
-                        default='data/openbhb/train/quasiraw_3d/metadata.tsv')
+                        default='data/openbhb/train/quasiraw_3d/metadata.tsv',
+                        help='Path to metadata.tsv or train.tsv')
     parser.add_argument('--output_dir', type=str,
                         default='data/openbhb/train_cache_64')
     parser.add_argument('--target_shape', type=int, nargs=3,
@@ -42,11 +43,17 @@ def main():
     parser.add_argument('--npy_suffix', type=str, default='_quasiraw_3d',
                         help='Suffix in .npy filenames (e.g. _quasiraw_3d)')
     parser.add_argument('--clip_range', type=float, default=3.0)
+    parser.add_argument('--split', type=str, default=None,
+                        help='Filter by split column (e.g. "train"). '
+                             'Only needed if metadata has a split column.')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     metadata = pd.read_csv(args.metadata, sep='\t')
+    if args.split and 'split' in metadata.columns:
+        metadata = metadata[metadata['split'] == args.split]
+        print(f'Filtered to split={args.split}: {len(metadata)} subjects')
     target_shape = tuple(args.target_shape)
 
     processed = 0

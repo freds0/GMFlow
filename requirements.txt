@@ -9,3 +9,6 @@ setuptools
 apex==0.9.10dev
 bitsandbytes
 yapf==0.40.1
+pandas
+diffusers
+matplotlib
