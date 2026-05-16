@@ -1,5 +1,5 @@
 # GMFlow 3D - OpenBHB Brain MRI Generation conditioned on Age
-# K=4 Gaussians, 64x64x64 volume, patch_size=4
+# K=4 Gaussians, 3D Haar wavelet domain: 1x64^3 -> 8x32^3
 # Designed for RTX 3090/4090 (24GB VRAM)
 name = 'gmflow3d_openbhb_k4'
 
@@ -7,18 +7,23 @@ model = dict(
     type='Diffusion3DAge',
     diffusion=dict(
         type='GMFlow3D',
+        use_wavelet=True,
+        randomize_trans_ratio=True,
         denoising=dict(
             type='GMDiTTransformer3DModel',
             num_gaussians=4,
+            gm_per_channel_logstd=True,
             logstd_inner_dim=1024,
             gm_num_logstd_layers=2,
             age_dropout_prob=0.1,
+            age_fourier_frequencies=8,
             num_attention_heads=12,
             attention_head_dim=64,  # inner_dim = 12 * 64 = 768
-            in_channels=1,
+            in_channels=8,
+            out_channels=8,
             num_layers=12,
-            sample_size=64,
-            patch_size=4,
+            sample_size=32,
+            patch_size=2,
             torch_dtype='float32',
             checkpointing=True),
         flow_loss=dict(
@@ -29,6 +34,7 @@ model = dict(
                 target='x_t_low',
                 pred_logstds='logstds',
                 pred_logweights='logweights'),
+            band_weights=[1.0, 2.0, 2.0, 3.0, 2.0, 3.0, 3.0, 4.0],
             weight_scale=2.0),
         num_timesteps=1000,
         timestep_sampler=dict(type='ContinuousTimeStepSampler', shift=1.0, logit_normal_enable=True),
@@ -42,7 +48,10 @@ eval_interval = 10000
 work_dir = 'work_dirs/' + name
 
 train_cfg = dict(
-    trans_ratio=0.5,
+    trans_ratio=0.5,  # fallback when randomize_trans_ratio=False
+    randomize_trans_ratio=True,
+    trans_ratio_min=0.05,
+    trans_ratio_max=1.0,
     prob_age=0.9,  # 10% unconditional for CFG
     diffusion_grad_clip=10.0,
     diffusion_grad_clip_begin_iter=1000,
@@ -53,6 +62,7 @@ test_cfg = dict(
     output_mode='mean',
     num_timesteps=16,
     num_substeps=4,
+    order=2,
 )
 
 optimizer = {
@@ -113,6 +123,7 @@ evaluation = [
                 guidance_scale=guidance_scale,
                 num_timesteps=step,
                 num_substeps=substep,
+                order=2,
             )),
         interval=eval_interval,
         feed_batch_size=2,

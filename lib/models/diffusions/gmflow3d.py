@@ -24,6 +24,7 @@ from . import GaussianFlow, schedulers
 from lib.ops.gmflow_ops.gmflow_ops_3d import (
     gm_to_mean_3d, gm_to_sample_3d, gm_to_iso_gaussian_3d,
     gm_mul_iso_gaussian_3d, iso_gaussian_mul_iso_gaussian_3d)
+from .wavelet import haar_dwt3d, haar_idwt3d
 
 
 @torch.jit.script
@@ -73,7 +74,7 @@ def denoising_gm_convert_to_mean_3d_jit(
 
     out_means = (g_var * gm_means + gm_vars * g_mean) / norm_factor
     # 3D: sum over channels at dim=-4
-    logweights_delta = gm_diffs.square().sum(dim=-4, keepdim=True) * (-0.5 / norm_factor)
+    logweights_delta = (gm_diffs.square() / norm_factor).sum(dim=-4, keepdim=True) * -0.5
     out_weights = (gm_logweights + logweights_delta).softmax(dim=-5)
 
     out_mean = (out_means * out_weights).sum(dim=-5)
@@ -243,15 +244,93 @@ class GMFlow3DMixin:
         self.prev_t = None
         self.prev_h = None
 
+    def gm_2nd_order_3d(
+            self, gm_output, gaussian_output, x_t, t, h,
+            guidance_scale=0.0, gm_cond=None, gaussian_cond=None, avg_var=None, cfg_bias=None,
+            ca=0.005, cb=1.0, gm2_correction_steps=0):
+        if self.prev_gm is not None:
+            if cfg_bias is not None:
+                gm_mean = gm_to_mean_3d(gm_output)
+                base_gaussian = gaussian_cond
+                base_gm = gm_cond
+            else:
+                gm_mean = gaussian_output['mean']
+                base_gaussian = gaussian_output
+                base_gm = gm_output
+
+            mean_from_prev = self.denoising_gm_convert_to_mean_3d(
+                self.prev_gm, x_t, self.prev_x_t, t, self.prev_t, prediction_type='x0')
+            self.prev_gm = gm_output
+
+            k = 0.5 * h / self.prev_h
+            prev_h_norm = self.prev_h / self.num_timesteps
+            _guidance_scale = guidance_scale * cb
+            if avg_var is None:
+                avg_var = base_gaussian['var'].mean(dim=(-4, -3, -2, -1), keepdim=True)
+            err_power = avg_var * (_guidance_scale * _guidance_scale + ca)
+            mean_diff = (gm_mean - mean_from_prev) * (
+                (1 - err_power / (prev_h_norm * prev_h_norm)).clamp(min=0).sqrt() * k)
+
+            bias = mean_diff if cfg_bias is None else mean_diff + cfg_bias
+            bias_power = bias.square().mean(dim=(-4, -3, -2, -1), keepdim=True)
+            bias = bias * (avg_var / bias_power.clamp(min=1e-6)).clamp(max=1).sqrt()
+
+            gaussian_output = dict(
+                mean=base_gaussian['mean'] + bias,
+                var=base_gaussian['var'] * (1 - bias_power / avg_var.clamp(min=1e-6)).clamp(min=1e-6))
+            gm_output = gm_mul_iso_gaussian_3d(
+                base_gm, iso_gaussian_mul_iso_gaussian_3d(gaussian_output, base_gaussian, 1, -1),
+                1, 1)[0]
+
+            if gm2_correction_steps > 0:
+                adjusted_bias = bias
+                tgt_bias = mean_diff + gm_mean - base_gaussian['mean']
+                for _ in range(gm2_correction_steps):
+                    out_bias = gm_to_mean_3d(gm_output) - base_gaussian['mean']
+                    err = out_bias - tgt_bias
+                    adjusted_bias = adjusted_bias - err * (
+                        adjusted_bias.norm(dim=-4, keepdim=True)
+                        / out_bias.norm(dim=-4, keepdim=True).clamp(min=1e-6)
+                    ).clamp(max=1)
+                    adjusted_bias_power = adjusted_bias.square().mean(dim=(-4, -3, -2, -1), keepdim=True)
+                    adjusted_bias = adjusted_bias * (
+                        avg_var / adjusted_bias_power.clamp(min=1e-6)).clamp(max=1).sqrt()
+                    adjusted_gaussian_output = dict(
+                        mean=base_gaussian['mean'] + adjusted_bias,
+                        var=base_gaussian['var'] * (
+                            1 - adjusted_bias_power / avg_var.clamp(min=1e-6)).clamp(min=1e-6))
+                    gm_output = gm_mul_iso_gaussian_3d(
+                        base_gm,
+                        iso_gaussian_mul_iso_gaussian_3d(adjusted_gaussian_output, base_gaussian, 1, -1),
+                        1, 1)[0]
+        else:
+            self.prev_gm = gm_output
+
+        self.prev_x_t = x_t
+        self.prev_t = t
+        self.prev_h = h
+        return gm_output, gaussian_output
+
 
 @MODULES.register_module()
 class GMFlow3D(GaussianFlow, GMFlow3DMixin):
     """3D GMFlow for volumetric data. No spectrum_net."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+            self,
+            *args,
+            use_wavelet=False,
+            randomize_trans_ratio=False,
+            trans_ratio_min=0.05,
+            trans_ratio_max=1.0,
+            **kwargs):
         # Remove spectrum_net if passed (not supported in 3D)
         kwargs.pop('spectrum_net', None)
         super().__init__(*args, **kwargs)
+        self.use_wavelet = use_wavelet
+        self.randomize_trans_ratio = randomize_trans_ratio
+        self.trans_ratio_min = trans_ratio_min
+        self.trans_ratio_max = trans_ratio_max
         self.intermediate_x_t = []
         self.intermediate_x_0 = []
 
@@ -290,12 +369,19 @@ class GMFlow3D(GaussianFlow, GMFlow3DMixin):
         device = get_module_device(self)
 
         assert x_0.dim() == 5, f'Expected 5D input (bs, C, D, H, W), got {x_0.dim()}D'
+        if self.use_wavelet:
+            x_0 = haar_dwt3d(x_0)
         num_batches = x_0.size(0)
         trans_ratio = self.train_cfg.get('trans_ratio', 1.0)
+        randomize_trans_ratio = self.train_cfg.get('randomize_trans_ratio', self.randomize_trans_ratio)
         eps = self.train_cfg.get('eps', 1e-4)
 
         with torch.autocast(device_type='cuda', enabled=False):
             t_high = self.timestep_sampler(num_batches).to(device).clamp(min=eps, max=self.num_timesteps)
+            if randomize_trans_ratio:
+                ratio_min = self.train_cfg.get('trans_ratio_min', self.trans_ratio_min)
+                ratio_max = self.train_cfg.get('trans_ratio_max', self.trans_ratio_max)
+                trans_ratio = torch.empty_like(t_high).uniform_(ratio_min, ratio_max)
             t_low = t_high * (1 - trans_ratio)
             t_low = torch.minimum(t_low, t_high - eps).clamp(min=0)
 
@@ -319,6 +405,10 @@ class GMFlow3D(GaussianFlow, GMFlow3DMixin):
             self, x_0=None, noise=None, guidance_scale=0.0,
             test_cfg_override=dict(), show_pbar=False, **kwargs):
         x_t = torch.randn_like(x_0) if noise is None else noise
+        expected_channels = getattr(
+            getattr(self.denoising, 'config', None), 'in_channels', x_t.size(1))
+        if self.use_wavelet and x_t.size(1) != expected_channels:
+            x_t = haar_dwt3d(x_t)
         num_batches = x_t.size(0)
         ori_dtype = x_t.dtype
         x_t = x_t.float()
@@ -347,6 +437,11 @@ class GMFlow3D(GaussianFlow, GMFlow3DMixin):
         num_timesteps = cfg.get('num_timesteps', self.num_timesteps)
         num_substeps = cfg.get('num_substeps', 1)
         orthogonal_guidance = cfg.get('orthogonal_guidance', 1.0)
+        save_intermediate = cfg.get('save_intermediate', False)
+        order = cfg.get('order', 1)
+        gm2_coefs = cfg.get('gm2_coefs', [0.005, 1.0])
+        gm2_correction_steps = cfg.get('gm2_correction_steps', 0)
+        assert order in [1, 2]
 
         sampler.set_timesteps(num_timesteps * num_substeps, device=x_t.device)
         timesteps = sampler.timesteps
@@ -361,6 +456,9 @@ class GMFlow3D(GaussianFlow, GMFlow3DMixin):
 
         for timestep_id in range(num_timesteps):
             t = timesteps[timestep_id * num_substeps]
+
+            if save_intermediate:
+                self.intermediate_x_t.append(x_t)
 
             x_t_input = x_t
             if use_guidance:
@@ -386,6 +484,18 @@ class GMFlow3D(GaussianFlow, GMFlow3DMixin):
                     1, 1)[0]
             else:
                 gaussian_output = gm_to_iso_gaussian_3d(gm_output)[0]
+                gm_cond = gaussian_cond = avg_var = cfg_bias = None
+
+            if order == 2:
+                if timestep_id < num_timesteps - 1:
+                    h = t - timesteps[(timestep_id + 1) * num_substeps]
+                else:
+                    h = t
+                gm_output, gaussian_output = self.gm_2nd_order_3d(
+                    gm_output, gaussian_output, x_t, t, h,
+                    guidance_scale, gm_cond, gaussian_cond, avg_var, cfg_bias,
+                    ca=gm2_coefs[0], cb=gm2_coefs[1],
+                    gm2_correction_steps=gm2_correction_steps)
 
             # GM ODE substeps
             x_t_base = x_t
@@ -400,12 +510,17 @@ class GMFlow3D(GaussianFlow, GMFlow3DMixin):
                         gm_output, x_t, x_t_base, t, t_base, prediction_type='x0')
                 x_t = sampler.step(model_output, t, x_t, return_dict=False, prediction_type='x0')[0]
 
+            if save_intermediate:
+                self.intermediate_x_0.append(model_output)
+
             if show_pbar:
                 pbar.update()
 
         if show_pbar:
             sys.stdout.write('\n')
 
+        if self.use_wavelet and not cfg.get('return_wavelet', False):
+            x_t = haar_idwt3d(x_t)
         return x_t.to(ori_dtype)
 
     def forward(self, x_0=None, return_loss=False, **kwargs):

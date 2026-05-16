@@ -264,6 +264,8 @@ Key options:
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `--volume_size` | 64 | Volume resolution (D=H=W) |
+| `--patch_size` | 4 | Patch size for tokenization |
 | `--num_layers` | 12 | Transformer depth |
 | `--num_heads` | 12 | Attention heads |
 | `--head_dim` | 64 | Head dimension (inner_dim = heads × head_dim) |
@@ -273,11 +275,121 @@ Key options:
 | `--use_ema` / `--no_ema` | enabled | Exponential moving average |
 | `--resume` | — | Resume from checkpoint |
 
-TensorBoard logs are saved to `{work_dir}/tb/`:
+### Training at Higher Resolutions (128³, 256³)
+
+The model supports arbitrary volume resolutions. The sequence length scales as `(volume_size / patch_size)³`, and attention memory scales quadratically with sequence length, so higher resolutions require adjusting `patch_size`, model size, and batch size.
+
+| Resolution | patch_size | Sequence length | Approx. VRAM (12 heads, 64 head_dim) |
+|------------|------------|-----------------|---------------------------------------|
+| 64³        | 4          | 16³ = 4,096     | ~12–16 GB                             |
+| 128³       | 8          | 16³ = 4,096     | ~12–16 GB                             |
+| 128³       | 4          | 32³ = 32,768    | ~100+ GB                              |
+| 256³       | 8          | 32³ = 32,768    | ~100+ GB                              |
+| 256³       | 16         | 16³ = 4,096     | ~12–16 GB                             |
+
+**Step 1: Preprocess at the target resolution**
+
+```bash
+# 128³
+python tools/prepare_openbhb.py \
+    --data_root data/openbhb/train/quasiraw_3d \
+    --metadata data/openbhb/train/quasiraw_3d/metadata.tsv \
+    --output_dir data/openbhb/train_cache_128 \
+    --target_shape 128 128 128
+
+# 256³
+python tools/prepare_openbhb.py \
+    --data_root data/openbhb/train/quasiraw_3d \
+    --metadata data/openbhb/train/quasiraw_3d/metadata.tsv \
+    --output_dir data/openbhb/train_cache_256 \
+    --target_shape 256 256 256
+```
+
+**Step 2: Train with matching `--volume_size` and `--patch_size`**
+
+To keep the sequence length manageable on a single 24 GB GPU, increase `patch_size` proportionally:
+
+```bash
+# 128³ on a 24 GB GPU (RTX 3090/4090) — patch_size=8 keeps seq_len = 4096
+python tools/train_standalone.py \
+    --cache_dir data/openbhb/train_cache_128 \
+    --metadata data/openbhb/train/quasiraw_3d/metadata.tsv \
+    --volume_size 128 --patch_size 8 \
+    --batch_size 1 --grad_accum 8 \
+    --work_dir work_dirs/gmflow3d_openbhb_128
+
+# 256³ on a 24 GB GPU — patch_size=16 keeps seq_len = 4096
+python tools/train_standalone.py \
+    --cache_dir data/openbhb/train_cache_256 \
+    --metadata data/openbhb/train/quasiraw_3d/metadata.tsv \
+    --volume_size 256 --patch_size 16 \
+    --batch_size 1 --grad_accum 8 \
+    --work_dir work_dirs/gmflow3d_openbhb_256
+```
+
+For multi-GPU setups with more VRAM (e.g., A100 80 GB), you can use smaller `patch_size` for finer-grained tokenization:
+
+```bash
+# 128³ with patch_size=4 (seq_len = 32768) — requires ~100 GB VRAM
+python tools/train_standalone.py \
+    --cache_dir data/openbhb/train_cache_128 \
+    --metadata data/openbhb/train/quasiraw_3d/metadata.tsv \
+    --volume_size 128 --patch_size 4 \
+    --batch_size 1 --grad_accum 8 \
+    --work_dir work_dirs/gmflow3d_openbhb_128_p4
+```
+
+> **Note:** Larger `patch_size` reduces the number of tokens but each patch covers a bigger spatial region. This trades spatial granularity for memory efficiency. For brain MRI, `patch_size=8` at 128³ or `patch_size=16` at 256³ are good starting points.
+
+### Logging
+
+By default, the standalone trainer logs to **TensorBoard**. You can also use **Weights & Biases (W&B)**, or both simultaneously.
+
+**TensorBoard only (default):**
 
 ```bash
 tensorboard --logdir work_dirs/gmflow3d_openbhb/tb
 ```
+
+**W&B only:**
+
+```bash
+# First time: authenticate with your API key
+pip install wandb
+wandb login
+
+# Train with W&B logging
+python tools/train_standalone.py \
+    --cache_dir data/openbhb/train_cache_64 \
+    --metadata data/openbhb/train/quasiraw_3d/metadata.tsv \
+    --logger wandb \
+    --wandb_project gmflow3d \
+    --wandb_name my_experiment \
+    --work_dir work_dirs/gmflow3d_openbhb
+```
+
+**Both TensorBoard and W&B:**
+
+```bash
+python tools/train_standalone.py \
+    --cache_dir data/openbhb/train_cache_64 \
+    --metadata data/openbhb/train/quasiraw_3d/metadata.tsv \
+    --logger tensorboard wandb \
+    --wandb_project gmflow3d \
+    --wandb_name my_experiment \
+    --work_dir work_dirs/gmflow3d_openbhb
+```
+
+W&B logging options:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--logger` | `tensorboard` | Logging backends (`tensorboard`, `wandb`, or both) |
+| `--wandb_project` | `gmflow3d` | W&B project name |
+| `--wandb_name` | auto-generated | W&B run name |
+| `--wandb_entity` | — | W&B team/entity (for shared projects) |
+
+W&B logs training loss, learning rate, gradient norm, and sample brain slices (axial, coronal, sagittal) at each sample interval. Runs can be resumed automatically if the `--work_dir` is the same.
 
 ### Inference
 

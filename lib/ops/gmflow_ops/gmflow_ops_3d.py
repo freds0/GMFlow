@@ -19,12 +19,12 @@ def gm_to_iso_gaussian_3d_jit(gm_weights, gm_means, gm_vars):
     Args:
         gm_weights: (bs, *, num_gaussians, 1, d, h, w)
         gm_means:   (bs, *, num_gaussians, out_channels, d, h, w)
-        gm_vars:    (bs, *, 1, 1, 1, 1, 1)
+        gm_vars:    (bs, *, 1, 1 or out_channels, 1, 1, 1)
     """
     g_mean = (gm_weights * gm_means).sum(-5, keepdim=True)  # (bs, *, 1, C, d, h, w)
     gm_diffs = gm_means - g_mean  # (bs, *, K, C, d, h, w)
-    g_var = (gm_weights * (gm_diffs * gm_diffs)).sum(-5, keepdim=True).mean(-4, keepdim=True) + gm_vars
-    # g_var: (bs, *, 1, 1, d, h, w)
+    g_var = (gm_weights * (gm_diffs * gm_diffs)).sum(-5, keepdim=True) + gm_vars
+    # g_var: (bs, *, 1, C, d, h, w), or C=1 for scalar variance
     return g_mean, g_var, gm_diffs
 
 
@@ -59,7 +59,7 @@ def gm_to_iso_gaussian_3d(gm):
     g_mean, g_var, gm_diffs = gm_to_iso_gaussian_3d_jit(gm_weights, gm_means, gm_vars)
     gaussian = dict(
         mean=g_mean.squeeze(-5),  # (bs, *, C, d, h, w)
-        var=g_var.squeeze(-5))    # (bs, *, 1, d, h, w)
+        var=g_var.squeeze(-5))    # (bs, *, C, d, h, w), or C=1 for scalar variance
 
     return gaussian, gm_diffs, gm_vars
 
@@ -95,7 +95,7 @@ def gm_to_sample_3d(gm, n_samples=1):
         torch.Tensor: (bs, n_samples, C, d, h, w)
     """
     means = gm['means']       # (bs, K, C, d, h, w)
-    logstds = gm['logstds']   # (bs, 1, 1, 1, 1, 1)
+    logstds = gm['logstds']   # (bs, 1, 1 or C, 1, 1, 1)
     logweights = gm['logweights']  # (bs, K, 1, d, h, w)
 
     batch_shape = means.shape[:-5]  # (bs,) or (bs, *)
@@ -120,8 +120,9 @@ def gm_to_sample_3d(gm, n_samples=1):
     idx_exp = indices.expand(flat_bs, n_samples, 1, C, d, h, w)
     selected = means_exp.gather(2, idx_exp).squeeze(2)  # (flat_bs, n_samples, C, d, h, w)
 
-    # Add Gaussian noise - logstds is scalar-like, reshape to (flat_bs, 1, 1, 1, 1, 1) for broadcast
-    std = logstds.reshape(-1, *([1] * (selected.dim() - 1))).exp()
+    # Add Gaussian noise. Supports scalar or per-channel/subband std.
+    std_channels = logstds.shape[-4]
+    std = logstds.reshape(-1, 1, std_channels, 1, 1, 1).exp()
     noise = torch.randn_like(selected) * std
     samples = selected + noise
 
@@ -136,7 +137,7 @@ def gm_mul_iso_gaussian_3d_jit(
     """Multiply 3D GM by isotropic Gaussian.
 
     gm_means:      (bs, *, K, C, d, h, w)
-    gm_vars:       (bs, *, 1, 1, 1, 1, 1)
+    gm_vars:       (bs, *, 1, 1 or C, 1, 1, 1)
     gm_logweights: (bs, *, K, 1, d, h, w)
     g_mean:        (bs, *, 1, C, d, h, w) or broadcastable
     g_var:         (bs, *, 1, 1, d, h, w) or broadcastable
@@ -146,7 +147,7 @@ def gm_mul_iso_gaussian_3d_jit(
     out_vars = g_var * gm_vars / norm_factor
 
     gm_diffs = gm_means - g_mean
-    logweights_delta = gm_diffs.square().sum(dim=-4, keepdim=True) * (-0.5 / norm_factor)
+    logweights_delta = (gm_diffs.square() / norm_factor).sum(dim=-4, keepdim=True) * -0.5
     out_logweights = (gm_logweights + logweights_delta).log_softmax(dim=-5)
 
     return out_means, out_vars, out_logweights

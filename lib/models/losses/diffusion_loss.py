@@ -39,7 +39,8 @@ def gaussian_mixture_nll_loss(
 
 @weighted_loss
 def gaussian_mixture_nll_loss_3d(
-        pred_means, target, pred_logstds, pred_logweights, eps=1e-4):
+        pred_means, target, pred_logstds, pred_logweights, eps=1e-4,
+        band_weights=None):
     """GM NLL loss for 3D volumes.
 
     Args:
@@ -53,8 +54,19 @@ def gaussian_mixture_nll_loss_3d(
     """
     inverse_std = torch.exp(-pred_logstds).clamp(max=1 / eps)
     diff_weighted = (pred_means - target.unsqueeze(-5)) * inverse_std
+    channel_ll = -0.5 * diff_weighted.square() - pred_logstds
+    if band_weights is not None:
+        weights = torch.as_tensor(
+            band_weights, dtype=channel_ll.dtype, device=channel_ll.device)
+        if weights.numel() != channel_ll.shape[-4]:
+            raise ValueError(
+                f'band_weights has {weights.numel()} entries, '
+                f'but prediction has {channel_ll.shape[-4]} channels')
+        weights = weights / weights.mean().clamp(min=1e-6)
+        weights = weights.view(*([1] * (channel_ll.dim() - 4)), -1, 1, 1, 1)
+        channel_ll = channel_ll * weights
     # sum over channels (dim=-4 for 3D: K, C, d, h, w -> sum C)
-    gaussian_ll = (-0.5 * diff_weighted.square() - pred_logstds).sum(dim=-4)
+    gaussian_ll = channel_ll.sum(dim=-4)
     # gaussian_ll: (bs, *, num_gaussians, d, h, w)
     loss = -torch.logsumexp(gaussian_ll + pred_logweights.squeeze(-4), dim=-4)
     return loss
@@ -189,7 +201,8 @@ class FlowNLLLoss(DDPMLossMod):
                  log_cfgs=None,
                  data_info=None,
                  reduction='mean',
-                 loss_name='loss_ddpm_nll'):
+                 loss_name='loss_ddpm_nll',
+                 band_weights=None):
         super().__init__(
             weight_scale=weight_scale,
             log_cfgs=log_cfgs,
@@ -325,7 +338,8 @@ class GMFlowNLLLoss(FlowNLLLoss):
                  log_cfgs=None,
                  data_info=None,
                  reduction='mean',
-                 loss_name='loss_ddpm_nll'):
+                 loss_name='loss_ddpm_nll',
+                 band_weights=None):
         super().__init__(
             weight_scale=weight_scale,
             log_cfgs=log_cfgs,
@@ -401,7 +415,8 @@ class GMFlowNLLLoss3D(FlowNLLLoss):
                  log_cfgs=None,
                  data_info=None,
                  reduction='mean',
-                 loss_name='loss_ddpm_nll'):
+                 loss_name='loss_ddpm_nll',
+                 band_weights=None):
         super().__init__(
             weight_scale=weight_scale,
             log_cfgs=log_cfgs,
@@ -409,7 +424,11 @@ class GMFlowNLLLoss3D(FlowNLLLoss):
             loss_name=loss_name)
         self.data_info = self._default_data_info \
             if data_info is None else data_info
-        self.loss_fn = partial(gaussian_mixture_nll_loss_3d, reduction='flatmean')
+        self.band_weights = band_weights
+        self.loss_fn = partial(
+            gaussian_mixture_nll_loss_3d,
+            reduction='flatmean',
+            band_weights=band_weights)
         if log_cfgs is not None and log_cfgs.get('type', None) == 'quartile':
             for i in range(4):
                 self.register_buffer(f'loss_quartile_{i}', torch.zeros((1,), dtype=torch.float))

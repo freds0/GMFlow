@@ -66,14 +66,29 @@ class AgeEmbedding(nn.Module):
     Includes a learnable null embedding for CFG dropout.
     """
 
-    def __init__(self, hidden_size, dropout_prob=0.0):
+    def __init__(self, hidden_size, dropout_prob=0.0, num_frequencies=8):
         super().__init__()
+        self.num_frequencies = num_frequencies
+        if num_frequencies > 0:
+            self.register_buffer(
+                'frequencies',
+                torch.arange(1, num_frequencies + 1, dtype=torch.float32),
+                persistent=False)
+        in_features = 2 + 2 * num_frequencies
         self.mlp = nn.Sequential(
-            nn.Linear(1, hidden_size),
+            nn.Linear(in_features, hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size))
         self.dropout_prob = dropout_prob
         self.null_embedding = nn.Parameter(torch.zeros(hidden_size))
+
+    def fourier_features(self, age):
+        age = age.unsqueeze(-1)
+        features = [age, age.square()]
+        if self.num_frequencies > 0:
+            angles = 2 * math.pi * age * self.frequencies.to(age)
+            features.extend([torch.sin(angles), torch.cos(angles)])
+        return torch.cat(features, dim=-1)
 
     def forward(self, age, force_drop=False):
         """
@@ -85,7 +100,7 @@ class AgeEmbedding(nn.Module):
         # Detect null condition (negative age = unconditional)
         is_null = age < 0  # (bs,)
 
-        age_input = age.clamp(min=0).unsqueeze(-1)  # (bs, 1)
+        age_input = self.fourier_features(age.clamp(min=0))
         emb = self.mlp(age_input)  # (bs, hidden_size)
 
         # Replace with null embedding where age is negative
@@ -98,14 +113,16 @@ class AgeEmbedding(nn.Module):
 class CombinedTimestepAgeEmbeddings(nn.Module):
     """Combines sinusoidal timestep embedding with age embedding (summed)."""
 
-    def __init__(self, embedding_dim, age_dropout_prob=0.0):
+    def __init__(self, embedding_dim, age_dropout_prob=0.0, age_fourier_frequencies=8):
         super().__init__()
         self.time_proj = Timesteps(
             num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
         self.timestep_embedder = TimestepEmbedding(
             in_channels=256, time_embed_dim=embedding_dim)
         self.age_embedder = AgeEmbedding(
-            embedding_dim, dropout_prob=age_dropout_prob)
+            embedding_dim,
+            dropout_prob=age_dropout_prob,
+            num_frequencies=age_fourier_frequencies)
 
     def forward(self, timestep, age, hidden_dtype=None):
         timesteps_proj = self.time_proj(timestep)
@@ -132,12 +149,15 @@ class GMOutput3D(nn.Module):
                  constant_logstd=None,
                  logstd_inner_dim=1024,
                  num_logstd_layers=2,
+                 per_channel_logstd=False,
                  activation_fn='silu'):
         super().__init__()
         self.num_gaussians = num_gaussians
         self.out_channels = out_channels
         self.embed_dim = embed_dim
         self.constant_logstd = constant_logstd
+        self.per_channel_logstd = per_channel_logstd
+        self.logstd_channels = out_channels if per_channel_logstd else 1
 
         if constant_logstd is None:
             if activation_fn == 'gelu-approximate':
@@ -158,7 +178,7 @@ class GMOutput3D(nn.Module):
             self.logstd_layers = nn.Sequential(
                 *logstd_layers,
                 act(),
-                nn.Linear(in_dim, 1))
+                nn.Linear(in_dim, self.logstd_channels))
 
         self.init_weights()
 
@@ -183,10 +203,11 @@ class GMOutput3D(nn.Module):
         means = means.view(bs, self.num_gaussians, self.out_channels, d, h, w)
         logweights = logweights.view(bs, self.num_gaussians, 1, d, h, w).log_softmax(dim=1)
         if self.constant_logstd is None:
-            logstds = self.logstd_layers(emb).view(bs, 1, 1, 1, 1, 1)
+            logstds = self.logstd_layers(emb).view(
+                bs, 1, self.logstd_channels, 1, 1, 1)
         else:
             logstds = torch.full(
-                (bs, 1, 1, 1, 1, 1), self.constant_logstd,
+                (bs, 1, self.logstd_channels, 1, 1, 1), self.constant_logstd,
                 dtype=x.dtype, device=x.device)
         return dict(
             means=means,
@@ -208,7 +229,9 @@ class _GMDiTTransformer3DModel(ModelMixin, ConfigMixin):
             constant_logstd=None,
             logstd_inner_dim=1024,
             gm_num_logstd_layers=2,
+            gm_per_channel_logstd: bool = False,
             age_dropout_prob=0.0,
+            age_fourier_frequencies: int = 8,
             num_attention_heads: int = 12,
             attention_head_dim: int = 64,
             in_channels: int = 1,
@@ -248,7 +271,9 @@ class _GMDiTTransformer3DModel(ModelMixin, ConfigMixin):
 
         # 2. Timestep + Age conditioning
         self.emb = CombinedTimestepAgeEmbeddings(
-            self.inner_dim, age_dropout_prob=0.0)
+            self.inner_dim,
+            age_dropout_prob=age_dropout_prob,
+            age_fourier_frequencies=age_fourier_frequencies)
 
         # 3. Transformer blocks (same as 2D, sequence-based)
         self.transformer_blocks = nn.ModuleList([
@@ -280,7 +305,8 @@ class _GMDiTTransformer3DModel(ModelMixin, ConfigMixin):
             self.inner_dim,
             constant_logstd=constant_logstd,
             logstd_inner_dim=logstd_inner_dim,
-            num_logstd_layers=gm_num_logstd_layers)
+            num_logstd_layers=gm_num_logstd_layers,
+            per_channel_logstd=gm_per_channel_logstd)
 
     def init_weights(self):
         for m in self.modules():
