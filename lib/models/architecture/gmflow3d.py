@@ -31,18 +31,35 @@ from ...core import rgetattr
 
 
 class PatchEmbed3D(nn.Module):
-    """3D Patch Embedding: Conv3d projection + learned positional embedding."""
+    """3D patch embedding with optional overlap between adjacent tokens."""
 
-    def __init__(self, volume_size=64, patch_size=4, in_channels=1, embed_dim=768):
+    def __init__(
+            self,
+            volume_size=64,
+            patch_size=4,
+            in_channels=1,
+            embed_dim=768,
+            overlap=False):
         super().__init__()
+        assert volume_size % patch_size == 0, (
+            f'volume_size ({volume_size}) must be divisible by patch_size '
+            f'({patch_size}); the learned pos_embed is sized for this grid.')
         self.volume_size = volume_size
         self.patch_size = patch_size
         self.num_patches_per_dim = volume_size // patch_size
         self.num_patches = self.num_patches_per_dim ** 3
+        self.overlap = overlap
+
+        # Keep the token grid unchanged while giving each token local context.
+        # This matters after Haar IDWT, where a patch edge doubles in voxel size.
+        kernel_size = 2 * patch_size - 1 if overlap else patch_size
+        padding = patch_size - 1 if overlap else 0
 
         self.proj = nn.Conv3d(
             in_channels, embed_dim,
-            kernel_size=patch_size, stride=patch_size)
+            kernel_size=kernel_size,
+            stride=patch_size,
+            padding=padding)
         self.pos_embed = nn.Parameter(
             torch.zeros(1, self.num_patches, embed_dim))
 
@@ -55,8 +72,58 @@ class PatchEmbed3D(nn.Module):
         """
         x = self.proj(x)  # (bs, embed_dim, D', H', W')
         x = x.flatten(2).transpose(1, 2)  # (bs, num_patches, embed_dim)
+        assert x.size(1) == self.num_patches, (
+            f'Got {x.size(1)} patches but pos_embed expects {self.num_patches} '
+            f'(volume_size={self.volume_size}, patch_size={self.patch_size}). '
+            f'Input spatial size does not match the configured sample_size.')
         x = x + self.pos_embed
         return x
+
+
+class LocalMixtureMeanRefiner3D(nn.Module):
+    """Predict a local residual correction for the GM mixture mean.
+
+    The final convolution is zero initialized, so enabling this module is an
+    identity operation when loading a checkpoint trained without it.
+    """
+
+    def __init__(self, channels, hidden_channels=64, num_layers=2):
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError('num_layers must be at least 1')
+
+        groups = min(8, hidden_channels)
+        while hidden_channels % groups != 0:
+            groups -= 1
+
+        self.in_proj = nn.Conv3d(
+            channels, hidden_channels, kernel_size=3, padding=1)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.GroupNorm(groups, hidden_channels),
+                nn.SiLU(),
+                nn.Conv3d(
+                    hidden_channels,
+                    hidden_channels,
+                    kernel_size=3,
+                    padding=1))
+            for _ in range(num_layers)
+        ])
+        self.out_norm = nn.GroupNorm(groups, hidden_channels)
+        self.out_proj = nn.Conv3d(
+            hidden_channels, channels, kernel_size=3, padding=1)
+        self.reset_output_parameters()
+
+    def reset_output_parameters(self):
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x):
+        hidden_states = self.in_proj(x)
+        for block in self.blocks:
+            hidden_states = hidden_states + block(hidden_states)
+        hidden_states = F.silu(self.out_norm(hidden_states))
+        return self.out_proj(hidden_states)
 
 
 class AgeEmbedding(nn.Module):
@@ -241,6 +308,10 @@ class _GMDiTTransformer3DModel(ModelMixin, ConfigMixin):
             attention_bias: bool = True,
             sample_size: int = 64,
             patch_size: int = 4,
+            overlap_patch_embed: bool = False,
+            local_refinement: bool = False,
+            refinement_hidden_channels: int = 64,
+            refinement_num_layers: int = 2,
             activation_fn: str = 'gelu-approximate',
             norm_type: str = 'ada_norm_zero',
             norm_elementwise_affine: bool = False,
@@ -257,6 +328,7 @@ class _GMDiTTransformer3DModel(ModelMixin, ConfigMixin):
         self.out_channels = in_channels if out_channels is None else out_channels
         self.gm_channels = num_gaussians * (self.out_channels + 1)
         self.gradient_checkpointing = False
+        self.local_refinement = local_refinement
 
         self.volume_size = sample_size
         self.patch_size = patch_size
@@ -267,7 +339,8 @@ class _GMDiTTransformer3DModel(ModelMixin, ConfigMixin):
             volume_size=sample_size,
             patch_size=patch_size,
             in_channels=in_channels,
-            embed_dim=self.inner_dim)
+            embed_dim=self.inner_dim,
+            overlap=overlap_patch_embed)
 
         # 2. Timestep + Age conditioning
         self.emb = CombinedTimestepAgeEmbeddings(
@@ -307,6 +380,11 @@ class _GMDiTTransformer3DModel(ModelMixin, ConfigMixin):
             logstd_inner_dim=logstd_inner_dim,
             num_logstd_layers=gm_num_logstd_layers,
             per_channel_logstd=gm_per_channel_logstd)
+        if self.local_refinement:
+            self.local_refiner = LocalMixtureMeanRefiner3D(
+                channels=self.out_channels,
+                hidden_channels=refinement_hidden_channels,
+                num_layers=refinement_num_layers)
 
     def init_weights(self):
         for m in self.modules():
@@ -332,6 +410,8 @@ class _GMDiTTransformer3DModel(ModelMixin, ConfigMixin):
         constant_init(self.proj_out_1, val=0)
 
         self.gm_out.init_weights()
+        if self.local_refinement:
+            self.local_refiner.reset_output_parameters()
 
     def enable_gradient_checkpointing(self):
         self.gradient_checkpointing = True
@@ -367,15 +447,17 @@ class _GMDiTTransformer3DModel(ModelMixin, ConfigMixin):
                 timestep,
                 torch.full_like(age, -1.0),
                 hidden_dtype=hidden_states.dtype)
+            # One mask per sample and forward pass. Re-sampling in every block
+            # mixes conditional and unconditional paths incoherently.
+            dropout_mask = (
+                torch.rand((bs, 1), device=hidden_states.device)
+                < self.config.age_dropout_prob)
+            emb = torch.where(dropout_mask, uncond_emb, cond_emb)
+        else:
+            emb = cond_emb
 
         # 3. Transformer blocks
         for block in self.transformer_blocks:
-            if dropout_enabled:
-                dropout_mask = torch.rand((bs, 1), device=hidden_states.device) < self.config.age_dropout_prob
-                emb = torch.where(dropout_mask, uncond_emb, cond_emb)
-            else:
-                emb = cond_emb
-
             if self.training and self.gradient_checkpointing:
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
@@ -400,12 +482,6 @@ class _GMDiTTransformer3DModel(ModelMixin, ConfigMixin):
                     emb=emb)
 
         # 4. Output: adaLN + project + unpatchify 3D
-        if dropout_enabled:
-            dropout_mask = torch.rand((bs, 1), device=hidden_states.device) < self.config.age_dropout_prob
-            emb = torch.where(dropout_mask, uncond_emb, cond_emb)
-        else:
-            emb = cond_emb
-
         shift, scale = self.proj_out_1(F.silu(emb)).chunk(2, dim=1)
         hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
         hidden_states = self.proj_out_2(hidden_states)
@@ -419,7 +495,15 @@ class _GMDiTTransformer3DModel(ModelMixin, ConfigMixin):
             npd * p, npd * p, npd * p)
         # hidden_states: (bs, gm_channels, D, H, W)
 
-        return self.gm_out(hidden_states, cond_emb.detach())
+        gm_output = self.gm_out(hidden_states, cond_emb.detach())
+        if self.local_refinement:
+            mixture_mean = (
+                gm_output['logweights'].exp() * gm_output['means']
+            ).sum(dim=1)
+            correction = self.local_refiner(mixture_mean)
+            gm_output['means'] = (
+                gm_output['means'] + correction.unsqueeze(1))
+        return gm_output
 
 
 @MODULES.register_module()

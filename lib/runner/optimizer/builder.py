@@ -1,5 +1,6 @@
 import inspect
-import bitsandbytes
+import warnings
+import torch
 
 from typing import List
 from mmcv.runner import build_optimizer
@@ -7,8 +8,31 @@ from lib.core.utils import rgetattr
 
 from mmcv.runner.optimizer.builder import OPTIMIZERS
 
+try:
+    import bitsandbytes
+except Exception as exc:
+    bitsandbytes = None
+    warnings.warn(
+        'bitsandbytes could not be imported. Falling back to torch.optim.AdamW '
+        f'for AdamW8bit optimizer configs. Original error: {exc}',
+        RuntimeWarning)
+
+
+@OPTIMIZERS.register_module(name='AdamW8bit', force=True)
+class AdamW8bitFallback(torch.optim.AdamW):
+    """Fallback for environments where bitsandbytes CUDA extensions are absent.
+
+    This keeps configs that request ``AdamW8bit`` runnable. It does not provide
+    8-bit optimizer states; install a working bitsandbytes build to restore that.
+    """
+
+    pass
+
 
 def register_bitsandbytes_optimizers() -> List:
+    if bitsandbytes is None:
+        return []
+
     bitsandbytes_optimizers = []
     for module_name in dir(bitsandbytes.optim):
         if module_name.startswith('__'):

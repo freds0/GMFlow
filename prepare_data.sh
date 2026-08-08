@@ -7,9 +7,9 @@ set -euo pipefail
 #   DATA_ROOT=/scratch/openbhb/quasiraw_3d OUTPUT_DIR=/scratch/openbhb/cache ./prepare_data.sh
 # Or override for one run with CLI flags:
 #   ./prepare_data.sh --target_shape 96 96 96 --clip_range 2.5
-DATA_ROOT="${DATA_ROOT:-data/openbhb/train/quasiraw_3d}"
-METADATA="${METADATA:-data/openbhb/train/quasiraw_3d/metadata.tsv}"
-OUTPUT_DIR="${OUTPUT_DIR:-data/openbhb/train_cache_64}"
+DATA_ROOT="${DATA_ROOT:-/home/fred/Projetos/Einstein/OpenBHB_Dataset/openbhb_train_sample/train/quasiraw_3d}"
+METADATA="${METADATA:-/home/fred/Projetos/Einstein/OpenBHB_Dataset/openbhb_train_sample/train/quasiraw_3d/metadata.tsv}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/fred/Projetos/Einstein/OpenBHB_Dataset/openbhb_train_sample/train/train_cache_64}"
 TARGET_SHAPE_D="${TARGET_SHAPE_D:-64}"
 TARGET_SHAPE_H="${TARGET_SHAPE_H:-64}"
 TARGET_SHAPE_W="${TARGET_SHAPE_W:-64}"

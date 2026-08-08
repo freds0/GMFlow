@@ -1,7 +1,24 @@
+import os
+
 # GMFlow 3D - OpenBHB Brain MRI Generation conditioned on Age
 # K=4 Gaussians, 3D Haar wavelet domain: 1x64^3 -> 8x32^3
 # Designed for RTX 3090/4090 (24GB VRAM)
 name = 'gmflow3d_openbhb_k4'
+
+openbhb_root = os.environ.get(
+    'OPENBHB_ROOT',
+    '/media/fred/FRED5TB/Einstein/Open_BHB_processado')
+openbhb_data_root = os.environ.get(
+    'OPENBHB_DATA_ROOT',
+    os.path.join(openbhb_root, 'train', 'quasiraw_3d'))
+openbhb_metadata = os.environ.get(
+    'OPENBHB_METADATA',
+    os.path.join(openbhb_root, 'train.tsv'))
+openbhb_cache = os.environ.get(
+    'OPENBHB_CACHE_DIR',
+    os.path.join(openbhb_root, 'train_cache_64'))
+batch_size = int(os.environ.get('BATCH_SIZE', '2'))
+learning_rate = float(os.environ.get('LEARNING_RATE', '1e-4'))
 
 model = dict(
     type='Diffusion3DAge',
@@ -15,7 +32,7 @@ model = dict(
             gm_per_channel_logstd=True,
             logstd_inner_dim=1024,
             gm_num_logstd_layers=2,
-            age_dropout_prob=0.1,
+            age_dropout_prob=0.0,  # CFG dropout handled at wrapper level via prob_age
             age_fourier_frequencies=8,
             num_attention_heads=12,
             attention_head_dim=64,  # inner_dim = 12 * 64 = 768
@@ -24,6 +41,10 @@ model = dict(
             num_layers=12,
             sample_size=32,
             patch_size=2,
+            overlap_patch_embed=True,
+            local_refinement=True,
+            refinement_hidden_channels=64,
+            refinement_num_layers=2,
             torch_dtype='float32',
             checkpointing=True),
         flow_loss=dict(
@@ -35,6 +56,11 @@ model = dict(
                 pred_logstds='logstds',
                 pred_logweights='logweights'),
             band_weights=[1.0, 2.0, 2.0, 3.0, 2.0, 3.0, 3.0, 4.0],
+            mixture_mean_weight=0.05,
+            voxel_gradient_weight=0.25,
+            reconstruct_wavelet=True,
+            boundary_period=4,
+            boundary_weight=2.0,
             weight_scale=2.0),
         num_timesteps=1000,
         timestep_sampler=dict(type='ContinuousTimeStepSampler', shift=1.0, logit_normal_enable=True),
@@ -44,7 +70,7 @@ model = dict(
 
 save_interval = 1000
 must_save_interval = 20000
-eval_interval = 10000
+eval_interval = 100
 work_dir = 'work_dirs/' + name
 
 train_cfg = dict(
@@ -55,40 +81,45 @@ train_cfg = dict(
     prob_age=0.9,  # 10% unconditional for CFG
     diffusion_grad_clip=10.0,
     diffusion_grad_clip_begin_iter=1000,
+    gradient_accumulation_steps=4,  # consumed by Diffusion3DAge.train_step
 )
 test_cfg = dict(
     volume_size=(1, 64, 64, 64),
     sampler='FlowEulerODE',
     output_mode='mean',
-    num_timesteps=16,
+    num_timesteps=25,
     num_substeps=4,
     order=2,
 )
 
 optimizer = {
     'diffusion': dict(
-        type='AdamW8bit', lr=1e-4, betas=(0.9, 0.95), weight_decay=0.05,
+        type='AdamW8bit', lr=learning_rate, betas=(0.9, 0.95), weight_decay=0.05,
         paramwise_cfg=dict(custom_keys={
             'bias': dict(decay_mult=0.0),
         })
     ),
 }
 
-gradient_accumulation_steps = 4  # effective batch size = 2 * 4 = 8
+gradient_accumulation_steps = train_cfg['gradient_accumulation_steps']  # effective batch = batch_size * this
 
 data = dict(
     workers_per_gpu=4,
     train=dict(
         type='OpenBHB',
-        data_root='data/openbhb/train/quasiraw_3d',
-        metadata_path='data/openbhb/train/quasiraw_3d/metadata.tsv',
+        data_root=openbhb_data_root,
+        metadata_path=openbhb_metadata,
+        age_min=6.0,
+        age_max=86.2,
         target_shape=(64, 64, 64),
-        use_cache=True,
-        cache_dir='data/openbhb/train_cache_64'),
-    train_dataloader=dict(samples_per_gpu=2),  # 24GB VRAM
+        use_cache=os.path.isdir(openbhb_cache),
+        cache_dir=openbhb_cache),
+    train_dataloader=dict(samples_per_gpu=batch_size),  # 24GB VRAM
     val=dict(
         type='OpenBHB',
         test_mode=True,
+        age_min=6.0,
+        age_max=86.2,
         num_test_volumes=16),
     val_dataloader=dict(samples_per_gpu=2),
     test_dataloader=dict(samples_per_gpu=2),
@@ -107,7 +138,7 @@ checkpoint_config = dict(
     max_keep_ckpts=1,
     out_dir='checkpoints/')
 
-step = 16
+step = 25
 substep = 4
 guidance_scale = 0.04
 
@@ -127,7 +158,7 @@ evaluation = [
             )),
         interval=eval_interval,
         feed_batch_size=2,
-        viz_step=16,
+        viz_step=1,
         viz_dir='viz/' + name + f'/gmode_g{guidance_scale:.2f}_step{step}',
         save_best_ckpt=False)]
 
@@ -140,6 +171,14 @@ log_config = dict(
     ])
 
 custom_hooks = [
+    dict(
+        type='VolumeTensorboardHook',
+        image_dir='viz/' + name + f'/gmode_g{guidance_scale:.2f}_step{step}',
+        tag='samples/' + name,
+        max_images=4,
+        interval=eval_interval,
+        boundary_period=4,
+        priority='LOW'),
     dict(
         type='ExponentialMovingAverageHookMod',
         module_keys=('diffusion_ema', ),

@@ -63,8 +63,20 @@ class Diffusion3DAge(BaseModel):
                 torch.rand_like(age) < prob_age,
                 age, data['negative_age'])
 
-        for v in optimizer.values():
-            v.zero_grad()
+        # Gradient accumulation: zero grads at the start of an accumulation
+        # cycle, scale the loss by 1/accum, and only step the optimizer at the
+        # end of the cycle. accum == 1 reproduces the original per-iter behavior.
+        accum = self.train_cfg.get('gradient_accumulation_steps', 1)
+        if accum > 1:
+            cur_iter = running_status['iteration']
+            is_cycle_start = cur_iter % accum == 0
+            is_cycle_end = cur_iter % accum == accum - 1
+        else:
+            is_cycle_start = is_cycle_end = True
+
+        if is_cycle_start:
+            for v in optimizer.values():
+                v.zero_grad()
 
         with torch.autocast(
                 device_type='cuda',
@@ -75,9 +87,11 @@ class Diffusion3DAge(BaseModel):
                 return_loss=True,
                 age=age)
 
-        loss.backward() if loss_scaler is None else loss_scaler.scale(loss).backward()
+        loss_bwd = loss / accum
+        loss_bwd.backward() if loss_scaler is None else loss_scaler.scale(loss_bwd).backward()
 
-        log_vars = self.step_optimizer(optimizer, loss_scaler, running_status, log_vars)
+        if is_cycle_end:
+            log_vars = self.step_optimizer(optimizer, loss_scaler, running_status, log_vars)
         log_vars = {k: float(v) for k, v in log_vars.items()}
         outputs_dict = dict(log_vars=log_vars, num_samples=bs)
 
@@ -118,9 +132,20 @@ class Diffusion3DAge(BaseModel):
                 if 'noise' in data:
                     noise = data['noise']
                 else:
-                    noise = torch.randn(
-                        (bs,) + tuple(volume_size),
-                        device=data['age'].device)
+                    seed = cfg.get('seed', None)
+                    if seed is not None:
+                        # Deterministic sampling: with output_mode='mean' the only
+                        # stochasticity is the initial noise, so a seeded generator
+                        # makes generation fully reproducible.
+                        generator = torch.Generator(
+                            device=data['age'].device).manual_seed(int(seed))
+                        noise = torch.randn(
+                            (bs,) + tuple(volume_size),
+                            device=data['age'].device, generator=generator)
+                    else:
+                        noise = torch.randn(
+                            (bs,) + tuple(volume_size),
+                            device=data['age'].device)
                 volumes_out = diffusion(
                     noise=noise,
                     age=age,

@@ -112,6 +112,7 @@ class GenerativeEvalHook(_GenerativeEvalHook):
                  clear_reals=False,
                  prefix='',
                  **kwargs):
+        kwargs.setdefault('metrics', [])
         super(GenerativeEvalHook, self).__init__(*args, **kwargs)
         self.data = data
         self.viz_dir = viz_dir

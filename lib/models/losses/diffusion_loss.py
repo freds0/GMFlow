@@ -416,7 +416,12 @@ class GMFlowNLLLoss3D(FlowNLLLoss):
                  data_info=None,
                  reduction='mean',
                  loss_name='loss_ddpm_nll',
-                 band_weights=None):
+                 band_weights=None,
+                 mixture_mean_weight=0.0,
+                 voxel_gradient_weight=0.0,
+                 reconstruct_wavelet=False,
+                 boundary_period=None,
+                 boundary_weight=1.0):
         super().__init__(
             weight_scale=weight_scale,
             log_cfgs=log_cfgs,
@@ -425,6 +430,17 @@ class GMFlowNLLLoss3D(FlowNLLLoss):
         self.data_info = self._default_data_info \
             if data_info is None else data_info
         self.band_weights = band_weights
+        self.mixture_mean_weight = float(mixture_mean_weight)
+        self.voxel_gradient_weight = float(voxel_gradient_weight)
+        self.reconstruct_wavelet = bool(reconstruct_wavelet)
+        self.boundary_period = boundary_period
+        self.boundary_weight = float(boundary_weight)
+        if self.mixture_mean_weight < 0 or self.voxel_gradient_weight < 0:
+            raise ValueError('Auxiliary loss weights must be non-negative')
+        if self.boundary_period is not None and self.boundary_period < 2:
+            raise ValueError('boundary_period must be at least 2')
+        if self.boundary_weight < 1:
+            raise ValueError('boundary_weight must be at least 1')
         self.loss_fn = partial(
             gaussian_mixture_nll_loss_3d,
             reduction='flatmean',
@@ -434,6 +450,68 @@ class GMFlowNLLLoss3D(FlowNLLLoss):
                 self.register_buffer(f'loss_quartile_{i}', torch.zeros((1,), dtype=torch.float))
                 self.register_buffer(f'var_quartile_{i}', torch.ones((1,), dtype=torch.float))
                 self.register_buffer(f'count_quartile_{i}', torch.zeros((1,), dtype=torch.long))
+
+    def _channel_weighted_l1(self, prediction, target):
+        error = (prediction - target).abs()
+        if self.band_weights is None:
+            return error.mean()
+
+        weights = torch.as_tensor(
+            self.band_weights, dtype=error.dtype, device=error.device)
+        if weights.numel() != error.shape[1]:
+            raise ValueError(
+                f'band_weights has {weights.numel()} entries, '
+                f'but prediction has {error.shape[1]} channels')
+        weights = weights / weights.mean().clamp(min=1e-6)
+        return (error * weights.view(1, -1, 1, 1, 1)).mean()
+
+    def _gradient_matching_loss(self, prediction, target):
+        losses = []
+        for axis in (-3, -2, -1):
+            pred_gradient = torch.diff(prediction, dim=axis)
+            target_gradient = torch.diff(target, dim=axis)
+            error = (pred_gradient - target_gradient).abs()
+
+            if self.boundary_period is not None and self.boundary_weight > 1:
+                length = error.shape[axis]
+                indices = torch.arange(length, device=error.device)
+                boundary = (indices + 1).remainder(self.boundary_period) == 0
+                axis_weights = torch.where(
+                    boundary,
+                    error.new_tensor(self.boundary_weight),
+                    error.new_tensor(1.0))
+                view_shape = [1] * error.dim()
+                view_shape[axis] = length
+                axis_weights = axis_weights.view(view_shape)
+                losses.append(
+                    (error * axis_weights).mean()
+                    / axis_weights.mean().clamp(min=1e-6))
+            else:
+                losses.append(error.mean())
+        return sum(losses) / len(losses)
+
+    def _auxiliary_losses(self, output_dict):
+        zero = output_dict['means'].new_zeros(())
+        if self.mixture_mean_weight == 0 and self.voxel_gradient_weight == 0:
+            return zero, zero
+
+        weights = output_dict['logweights'].exp()
+        prediction = (weights * output_dict['means']).sum(dim=-5)
+        target = output_dict[self.data_info['target']]
+
+        mean_loss = (
+            self._channel_weighted_l1(prediction, target)
+            if self.mixture_mean_weight > 0 else zero)
+
+        if self.voxel_gradient_weight > 0:
+            if self.reconstruct_wavelet:
+                from ..diffusions.wavelet import haar_idwt3d
+                prediction = haar_idwt3d(prediction)
+                target = haar_idwt3d(target)
+            gradient_loss = self._gradient_matching_loss(prediction, target)
+        else:
+            gradient_loss = zero
+        return mean_loss, gradient_loss
 
     def forward(self, *args, **kwargs):
         if len(args) == 1:
@@ -452,6 +530,10 @@ class GMFlowNLLLoss3D(FlowNLLLoss):
         loss = self._forward_loss(output_dict)
 
         loss_rescaled = loss * self.weight_scale
+        mean_aux, gradient_aux = self._auxiliary_losses(output_dict)
+        auxiliary_loss = (
+            self.mixture_mean_weight * mean_aux
+            + self.voxel_gradient_weight * gradient_aux)
 
         with torch.no_grad():
             weights = output_dict['logweights'].exp()
@@ -463,5 +545,9 @@ class GMFlowNLLLoss3D(FlowNLLLoss):
             _loss = loss
 
             self.collect_log(_loss, _var, timesteps=timesteps)
+            self.log_vars.update(
+                loss_gm_mean=float(mean_aux.detach()),
+                loss_voxel_gradient=float(gradient_aux.detach()),
+                loss_auxiliary=float(auxiliary_loss.detach()))
 
-        return reduce_loss(loss_rescaled, self.reduction)
+        return reduce_loss(loss_rescaled, self.reduction) + auxiliary_loss

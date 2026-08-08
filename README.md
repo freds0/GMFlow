@@ -41,29 +41,64 @@ GMFlow is an extension of diffusion/flow matching models.
 
 ## Installation
 
-The code has been tested in the environment described as follows:
+The current 3D OpenBHB/GMFlow setup has been tested on Linux with:
 
-- Linux (tested on Ubuntu 20 and above)
-- [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit-archive) 11.8 and above
-- [PyTorch](https://pytorch.org/get-started/previous-versions/) 2.1 and above
+- Python 3.9
+- PyTorch 2.0.1 + CUDA 11.8 wheels
+- TorchVision 0.15.2 + CUDA 11.8 wheels
+- MMCV Full 1.7.2 compiled for CUDA 11.8 / torch 2.0
+- NumPy 1.26.x
 
-Other dependencies can be installed via `pip install -r requirements.txt`. 
-
-An example of installation commands is shown below (assuming you have already installed CUDA Toolkit and configured the environment variables):
+Create a clean conda environment before installing the Python stack:
 
 ```bash
-# Create conda environment
-conda create -y -n gmflow python=3.10 numpy=1.26 ninja
+conda create -y -n gmflow python=3.9
 conda activate gmflow
 
-# Goto https://pytorch.org/ to select the appropriate version
-pip install torch torchvision
+python -m pip install -U "pip<27" "setuptools<70" wheel
 
-# Install other dependencies
-pip install -r requirements.txt
+python -m pip install torch==2.0.1 torchvision==0.15.2 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+python -m pip install -r requirements.txt
 ```
 
-This codebase may work on Windows systems, but it has not been tested extensively.
+Install the pinned MMGeneration fork as an editable local dependency. This avoids build-isolation failures where `setup.py` cannot see the already installed PyTorch package.
+
+```bash
+mkdir -p openmmlab-src
+git clone https://github.com/Lakonik/mmgeneration.git openmmlab-src/mmgeneration
+cd openmmlab-src/mmgeneration
+git checkout 500a93e474638c87dcaf8fad94cfbe1ef29acd1f
+python -m pip install -e . --no-build-isolation --no-deps
+cd ../..
+```
+
+If you use this repository's local patched `openmmlab-src/mmgeneration` directory, install it directly:
+
+```bash
+python -m pip install -e openmmlab-src/mmgeneration --no-build-isolation --no-deps
+```
+
+Check the environment before training:
+
+```bash
+python - <<'PY'
+import torch, torchvision, mmcv, mmgen, numpy
+print("torch:", torch.__version__, "cuda:", torch.version.cuda)
+print("torchvision:", torchvision.__version__)
+print("mmcv:", mmcv.__version__)
+print("mmgen:", mmgen.__version__)
+print("numpy:", numpy.__version__)
+print("cuda available:", torch.cuda.is_available())
+PY
+```
+
+Notes:
+
+- Keep `numpy<2`; older MMCV/TorchVision binary extensions can fail with NumPy 2.x.
+- `bitsandbytes` is optional. The optimizer registry falls back to `torch.optim.AdamW` if `bitsandbytes` cannot import.
+- This codebase may work on Windows, but the supported path is Linux/conda.
 
 ## GM-DiT ImageNet 256x256
 
@@ -228,7 +263,17 @@ This repository extends GMFlow to **3D volumetric brain MRI generation** using t
 
 1. Download the OpenBHB dataset and place raw `.npy` volumes under `data/openbhb/train/quasiraw_3d/` along with `metadata.tsv`.
 
-2. Preprocess volumes (downsample to 64³, normalize to [-1, 1]):
+2. Preprocess volumes (downsample to 64³, normalize to [-1, 1]). The wrapper script exposes the same arguments as environment variables and CLI flags:
+
+```bash
+./prepare_data.sh \
+    --data_root data/openbhb/train/quasiraw_3d \
+    --metadata data/openbhb/train/quasiraw_3d/metadata.tsv \
+    --output_dir data/openbhb/train_cache_64 \
+    --target_shape 64 64 64
+```
+
+Equivalent direct command:
 
 ```bash
 python tools/prepare_openbhb.py \
@@ -240,7 +285,31 @@ python tools/prepare_openbhb.py \
 
 ### Training
 
-The standalone training script requires **no mmcv/mmgen** — only PyTorch and diffusers:
+The main 3D wavelet GMFlow training path uses `train.py`, the OpenMMLab runner, and `configs/gmflow3d_openbhb_k4.py`. The helper script validates paths, exports common environment variables, and builds the final command safely:
+
+```bash
+./train.sh \
+    --data_dir data/openbhb/train/quasiraw_3d \
+    --output_dir work_dirs \
+    --model_config configs/gmflow3d_openbhb_k4.py \
+    --gpus 1
+```
+
+Resume from a checkpoint:
+
+```bash
+./train.sh --resume checkpoints/gmflow3d_openbhb_k4/latest.pth
+```
+
+Inspect the exact command without launching training:
+
+```bash
+./train.sh --dry-run
+```
+
+The 3D config currently validates every 100 training iterations. Generated validation volumes are saved under `viz/` and center slices are also written to TensorBoard under `work_dirs/.../tf_logs`.
+
+For the older standalone trainer:
 
 ```bash
 python tools/train_standalone.py \

@@ -85,6 +85,49 @@ def denoising_gm_convert_to_mean_3d_jit(
 class GMFlow3DMixin:
     """3D-specific GM flow operations."""
 
+    @staticmethod
+    def sanitize_gm_output_3d(gm_output, logstd_min=-12.0, logstd_max=4.0):
+        """Keep GM parameters finite before exp/log algebra.
+
+        A single NaN/Inf in the GM head quickly contaminates sampling because
+        variances are computed with exp(2 * logstd). Clamping logstds here keeps
+        the 3D sampler numerically usable during early or unstable training.
+        """
+        if not isinstance(gm_output, dict):
+            return torch.nan_to_num(gm_output, nan=0.0, posinf=0.0, neginf=0.0)
+
+        out = {}
+        for key, value in gm_output.items():
+            if key == 'logstds':
+                value = torch.nan_to_num(
+                    value, nan=0.0, posinf=logstd_max, neginf=logstd_min)
+                value = value.clamp(min=logstd_min, max=logstd_max)
+            elif key == 'logweights':
+                value = torch.nan_to_num(
+                    value, nan=-30.0, posinf=0.0, neginf=-30.0)
+                value = value.log_softmax(dim=-5)
+            else:
+                value = torch.nan_to_num(
+                    value, nan=0.0, posinf=1e4, neginf=-1e4)
+            out[key] = value
+        return out
+
+    @staticmethod
+    def sanitize_gaussian_output_3d(gaussian_output):
+        if not isinstance(gaussian_output, dict):
+            return gaussian_output
+        out = {}
+        for key, value in gaussian_output.items():
+            if key == 'var':
+                value = torch.nan_to_num(
+                    value, nan=1.0, posinf=1e8, neginf=1e-12)
+                value = value.clamp(min=1e-12, max=1e8)
+            else:
+                value = torch.nan_to_num(
+                    value, nan=0.0, posinf=1e4, neginf=-1e4)
+            out[key] = value
+        return out
+
     def sample_forward_transition_3d(self, x_t_low, t_low, t_high, noise):
         bs = x_t_low.size(0)
         if t_low.dim() == 0:
@@ -348,8 +391,10 @@ class GMFlow3D(GaussianFlow, GMFlow3DMixin):
         output = self.denoising(x_t, t, **kwargs)
         if isinstance(output, dict):
             output = {k: v.to(ori_dtype) for k, v in output.items()}
+            output = self.sanitize_gm_output_3d(output)
         else:
             output = output.to(ori_dtype)
+            output = self.sanitize_gm_output_3d(output)
         return output
 
     def loss(self, denoising_output, x_t_low, x_t_high, t_low, t_high):
@@ -467,6 +512,7 @@ class GMFlow3D(GaussianFlow, GMFlow3DMixin):
             gm_output = self.pred(x_t_input, t, **kwargs)
             assert isinstance(gm_output, dict)
             gm_output = self.u_to_x_0_3d(gm_output, x_t_input, t)
+            gm_output = self.sanitize_gm_output_3d(gm_output)
 
             # Probabilistic CFG (3D)
             if use_guidance:
@@ -475,15 +521,19 @@ class GMFlow3D(GaussianFlow, GMFlow3DMixin):
                 uncond_mean = gm_to_mean_3d(gm_uncond)
                 gaussian_cond = gm_to_iso_gaussian_3d(gm_cond)[0]
                 gaussian_cond['var'] = gaussian_cond['var'].mean(dim=(-1, -2, -3), keepdim=True)
+                gaussian_cond = self.sanitize_gaussian_output_3d(gaussian_cond)
                 gaussian_output, cfg_bias, avg_var = probabilistic_guidance_3d_jit(
                     gaussian_cond['mean'], gaussian_cond['var'], uncond_mean, guidance_scale,
                     orthogonal=orthogonal_guidance)
+                gaussian_output = self.sanitize_gaussian_output_3d(gaussian_output)
                 gm_output = gm_mul_iso_gaussian_3d(
                     gm_cond,
                     iso_gaussian_mul_iso_gaussian_3d(gaussian_output, gaussian_cond, 1, -1),
                     1, 1)[0]
+                gm_output = self.sanitize_gm_output_3d(gm_output)
             else:
                 gaussian_output = gm_to_iso_gaussian_3d(gm_output)[0]
+                gaussian_output = self.sanitize_gaussian_output_3d(gaussian_output)
                 gm_cond = gaussian_cond = avg_var = cfg_bias = None
 
             if order == 2:
@@ -496,6 +546,8 @@ class GMFlow3D(GaussianFlow, GMFlow3DMixin):
                     guidance_scale, gm_cond, gaussian_cond, avg_var, cfg_bias,
                     ca=gm2_coefs[0], cb=gm2_coefs[1],
                     gm2_correction_steps=gm2_correction_steps)
+                gm_output = self.sanitize_gm_output_3d(gm_output)
+                gaussian_output = self.sanitize_gaussian_output_3d(gaussian_output)
 
             # GM ODE substeps
             x_t_base = x_t
@@ -508,7 +560,10 @@ class GMFlow3D(GaussianFlow, GMFlow3DMixin):
                     t = timesteps[timestep_id * num_substeps + substep_id]
                     model_output = self.denoising_gm_convert_to_mean_3d(
                         gm_output, x_t, x_t_base, t, t_base, prediction_type='x0')
+                model_output = torch.nan_to_num(
+                    model_output, nan=0.0, posinf=1e4, neginf=-1e4)
                 x_t = sampler.step(model_output, t, x_t, return_dict=False, prediction_type='x0')[0]
+                x_t = torch.nan_to_num(x_t, nan=0.0, posinf=1e4, neginf=-1e4)
 
             if save_intermediate:
                 self.intermediate_x_0.append(model_output)
@@ -521,6 +576,10 @@ class GMFlow3D(GaussianFlow, GMFlow3DMixin):
 
         if self.use_wavelet and not cfg.get('return_wavelet', False):
             x_t = haar_idwt3d(x_t)
+            # Clamp to the training intensity range once back in voxel space.
+            x_t = x_t.clamp(-1.0, 1.0)
+        if cfg.get('sanitize_output', True):
+            x_t = torch.nan_to_num(x_t, nan=0.0, posinf=1e4, neginf=-1e4)
         return x_t.to(ori_dtype)
 
     def forward(self, x_0=None, return_loss=False, **kwargs):

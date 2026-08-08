@@ -203,55 +203,160 @@ def mock_framework():
 # Simple dataset (no mmcv dependency)
 # ---------------------------------------------------------------------------
 
-class OpenBHBSimple(Dataset):
-    """OpenBHB dataset that loads cached .pt volumes + age from metadata.
+class OpenBHBStandaloneDataset(Dataset):
+    """Load OpenBHB from a prepared .pt cache or directly from .npy volumes."""
 
-    Supports both the per-split metadata.tsv (columns: participant_id, age)
-    and the full dataset train.tsv (columns: participant_id, split, sex, age, ...).
-    """
-
-    def __init__(self, cache_dir, metadata_path, age_min=6.0, age_max=86.0,
-                 random_flip=True, negative_age=-1.0, split=None):
+    def __init__(
+            self,
+            metadata_path,
+            cache_dir=None,
+            data_root=None,
+            volume_size=64,
+            npy_suffix='_quasiraw_3d',
+            age_min=None,
+            age_max=None,
+            random_flip=True,
+            negative_age=-1.0,
+            split=None,
+            clip_range=3.0):
         self.cache_dir = cache_dir
-        self.age_min = age_min
-        self.age_range = age_max - age_min
+        self.data_root = data_root
+        self.volume_size = int(volume_size)
+        self.npy_suffix = npy_suffix
         self.random_flip = random_flip
         self.negative_age = negative_age
+        self.clip_range = float(clip_range)
 
         metadata = pd.read_csv(metadata_path, sep='\t')
         if split and 'split' in metadata.columns:
             metadata = metadata[metadata['split'] == split]
             print(f'Filtered to split={split}: {len(metadata)} rows')
+        if 'age' not in metadata.columns:
+            raise ValueError(f'Metadata has no age column: {metadata_path}')
+
+        metadata = metadata.copy()
+        metadata['age'] = pd.to_numeric(metadata['age'], errors='coerce')
+        metadata = metadata[np.isfinite(metadata['age'])]
 
         self.subjects = []
         for _, row in metadata.iterrows():
-            pid = str(row['participant_id'])
-            pt_path = os.path.join(cache_dir, f'{pid}.pt')
-            if os.path.exists(pt_path):
-                self.subjects.append(dict(
-                    participant_id=pid,
-                    age=float(row['age']),
-                    path=pt_path))
-        print(f'OpenBHBSimple: loaded {len(self.subjects)} subjects from {cache_dir}')
+            participant_id = str(
+                row.get('participant_id', row.get('scan_id', 'unknown')))
+            scan_value = row.get('scan_id', participant_id)
+            scan_id = participant_id if pd.isna(scan_value) else str(scan_value)
+
+            cache_path = None
+            cache_value = row.get('cache_file', None)
+            if cache_dir is not None:
+                cache_name = (
+                    f'{participant_id}.pt'
+                    if cache_value is None or pd.isna(cache_value)
+                    else str(cache_value))
+                cache_path = (
+                    cache_name if os.path.isabs(cache_name)
+                    else os.path.join(cache_dir, cache_name))
+
+            raw_path = None
+            if data_root is not None:
+                raw_path = os.path.join(
+                    data_root, f'{participant_id}{npy_suffix}.npy')
+
+            if cache_path is not None and os.path.exists(cache_path):
+                path, source = cache_path, 'cache'
+            elif raw_path is not None and os.path.exists(raw_path):
+                path, source = raw_path, 'raw'
+            else:
+                continue
+
+            self.subjects.append(dict(
+                participant_id=participant_id,
+                scan_id=scan_id,
+                age=float(row['age']),
+                path=path,
+                source=source))
+
+        if not self.subjects:
+            raise RuntimeError(
+                f'No OpenBHB volumes were found using metadata={metadata_path}, '
+                f'cache_dir={cache_dir}, data_root={data_root}')
+
+        ages = np.asarray(
+            [subject['age'] for subject in self.subjects], dtype=np.float64)
+        self.age_min = float(ages.min()) if age_min is None else float(age_min)
+        self.age_max = float(ages.max()) if age_max is None else float(age_max)
+        if self.age_max <= self.age_min:
+            raise ValueError(
+                f'age_max ({self.age_max}) must be greater than '
+                f'age_min ({self.age_min})')
+        if ages.min() < self.age_min or ages.max() > self.age_max:
+            raise ValueError(
+                f'Metadata ages [{ages.min()}, {ages.max()}] are outside '
+                f'configured range [{self.age_min}, {self.age_max}]')
+        self.age_range = self.age_max - self.age_min
+        self.volume_shape = (self.volume_size,) * 3
+
+        cached = sum(subject['source'] == 'cache' for subject in self.subjects)
+        raw = len(self.subjects) - cached
+        print(
+            f'OpenBHBStandaloneDataset: loaded {len(self.subjects)} scans '
+            f'({cached} cached, {raw} raw)')
+        print(f'  Age range: [{self.age_min:g}, {self.age_max:g}] years')
+        print(f'  Output volume shape: {self.volume_shape}')
 
     def __len__(self):
         return len(self.subjects)
 
+    def _load_volume(self, subject):
+        if subject['source'] == 'cache':
+            volume = torch.load(
+                subject['path'], map_location='cpu', weights_only=True)
+            if not isinstance(volume, torch.Tensor):
+                raise TypeError(
+                    f'Expected tensor cache at {subject["path"]}, '
+                    f'got {type(volume).__name__}')
+        else:
+            volume = torch.from_numpy(
+                np.load(subject['path']).astype(np.float32))
+
+        volume = volume.float().squeeze()
+        if volume.dim() != 3:
+            raise ValueError(
+                f'Expected a 3D volume at {subject["path"]}, '
+                f'got shape {tuple(volume.shape)}')
+        volume = volume.unsqueeze(0).unsqueeze(0)
+        if tuple(volume.shape[-3:]) != self.volume_shape:
+            volume = torch.nn.functional.interpolate(
+                volume,
+                size=self.volume_shape,
+                mode='trilinear',
+                align_corners=False)
+        volume = volume.squeeze(0)
+
+        volume = torch.nan_to_num(volume)
+        mean = volume.mean()
+        std = volume.std().clamp(min=1e-6)
+        volume = ((volume - mean) / std).clamp(
+            -self.clip_range, self.clip_range)
+        return volume / self.clip_range
+
     def __getitem__(self, idx):
         subject = self.subjects[idx]
-        vol = torch.load(subject['path'], weights_only=True)  # (1, D, H, W)
+        volume = self._load_volume(subject)
 
         if self.random_flip and torch.rand(()).item() < 0.5:
-            vol = vol.flip(-1)
+            volume = volume.flip(-1)
 
         age_norm = (subject['age'] - self.age_min) / self.age_range
-
         return dict(
-            volumes=vol,
+            volumes=volume,
             age=torch.tensor(age_norm, dtype=torch.float32),
             negative_age=torch.tensor(self.negative_age, dtype=torch.float32),
-            participant_id=subject['participant_id'])
+            participant_id=subject['participant_id'],
+            scan_id=subject['scan_id'])
 
+
+# Backwards-compatible name used by existing scripts.
+OpenBHBSimple = OpenBHBStandaloneDataset
 
 def collate_fn(batch):
     """Simple collate that stacks tensors and collects strings."""
@@ -297,9 +402,20 @@ class EMAModel:
         return {k: v.clone() for k, v in self.shadow.items()}
 
     def load_state_dict(self, state_dict):
-        for k, v in state_dict.items():
-            if k in self.shadow:
-                self.shadow[k].copy_(v)
+        loaded = 0
+        skipped = []
+        for key, value in state_dict.items():
+            if (
+                    key in self.shadow
+                    and self.shadow[key].shape == value.shape):
+                self.shadow[key].copy_(value)
+                loaded += 1
+            else:
+                skipped.append(key)
+        if skipped:
+            print(
+                f'EMA: loaded {loaded} tensors and skipped '
+                f'{len(skipped)} incompatible tensors')
 
 
 # ---------------------------------------------------------------------------
@@ -307,41 +423,66 @@ class EMAModel:
 # ---------------------------------------------------------------------------
 
 def build_model(args, device):
-    """Build GMFlow3D model from components."""
+    """Build the 3D GMFlow model used by the standalone trainer."""
     from lib.models.architecture.gmflow3d import _GMDiTTransformer3DModel
     from lib.models.diffusions.gmflow3d import GMFlow3D
     from lib.models.diffusions.sampler import ContinuousTimeStepSampler
     from lib.models.losses.diffusion_loss import GMFlowNLLLoss3D
 
-    # Denoising network
+    model_volume_size = (
+        args.volume_size // 2 if args.use_wavelet else args.volume_size)
+    model_channels = 8 if args.use_wavelet else 1
+
     denoising = _GMDiTTransformer3DModel(
         num_gaussians=args.num_gaussians,
         num_attention_heads=args.num_heads,
         attention_head_dim=args.head_dim,
-        in_channels=1,
+        in_channels=model_channels,
+        out_channels=model_channels,
         num_layers=args.num_layers,
-        sample_size=args.volume_size,
+        sample_size=model_volume_size,
         patch_size=args.patch_size,
-        age_dropout_prob=args.age_dropout_prob)
+        overlap_patch_embed=args.overlap_patch_embed,
+        local_refinement=args.local_refinement,
+        refinement_hidden_channels=args.refinement_hidden_channels,
+        refinement_num_layers=args.refinement_num_layers,
+        gm_per_channel_logstd=(
+            args.per_channel_logstd and args.use_wavelet),
+        age_dropout_prob=args.age_dropout_prob,
+        age_fourier_frequencies=args.age_fourier_frequencies)
     denoising.init_weights()
     if args.checkpointing:
         denoising.gradient_checkpointing = True
 
-    # Loss
+    band_weights = (
+        [1.0, 2.0, 2.0, 3.0, 2.0, 3.0, 3.0, 4.0]
+        if args.use_wavelet else None)
+    boundary_period = args.boundary_period
+    if boundary_period is None:
+        boundary_period = args.patch_size * (2 if args.use_wavelet else 1)
+
     flow_loss = GMFlowNLLLoss3D(
         weight_scale=2.0,
+        band_weights=band_weights,
+        mixture_mean_weight=args.mixture_mean_weight,
+        voxel_gradient_weight=args.voxel_gradient_weight,
+        reconstruct_wavelet=args.use_wavelet,
+        boundary_period=boundary_period,
+        boundary_weight=args.boundary_weight,
         data_info=dict(
             pred_means='means',
             target='x_t_low',
             pred_logstds='logstds',
             pred_logweights='logweights'),
-        log_cfgs=dict(type='quartile', prefix_name='loss_trans', total_timesteps=1000))
+        log_cfgs=dict(
+            type='quartile',
+            prefix_name='loss_trans',
+            total_timesteps=1000))
 
-    # Timestep sampler
     timestep_sampler = ContinuousTimeStepSampler(
         num_timesteps=1000, shift=1.0, logit_normal_enable=True)
 
-    # Assemble GMFlow3D (bypass build_module)
+    # Assemble GMFlow3D without relying on mmcv/mmgen builders.
     diffusion = GMFlow3D.__new__(GMFlow3D)
     torch.nn.Module.__init__(diffusion)
     diffusion.num_timesteps = 1000
@@ -349,18 +490,28 @@ def build_model(args, device):
     diffusion.denoising_mean_mode = 'U'
     diffusion.timestep_sampler = timestep_sampler
     diffusion.flow_loss = flow_loss
-    diffusion.train_cfg = dict(trans_ratio=0.5, eps=1e-4)
+    diffusion.train_cfg = dict(
+        trans_ratio=0.5,
+        eps=1e-4,
+        randomize_trans_ratio=args.randomize_trans_ratio,
+        trans_ratio_min=args.trans_ratio_min,
+        trans_ratio_max=args.trans_ratio_max)
     diffusion.test_cfg = dict(
-        sampler='FlowEulerODE', output_mode='mean',
-        num_timesteps=16, num_substeps=4)
+        sampler='FlowEulerODE',
+        output_mode='mean',
+        num_timesteps=args.sample_timesteps,
+        num_substeps=args.sample_substeps,
+        order=args.sample_order)
+    diffusion.use_wavelet = args.use_wavelet
+    diffusion.randomize_trans_ratio = args.randomize_trans_ratio
+    diffusion.trans_ratio_min = args.trans_ratio_min
+    diffusion.trans_ratio_max = args.trans_ratio_max
     diffusion.intermediate_x_t = []
     diffusion.intermediate_x_0 = []
-
     diffusion = diffusion.to(device)
 
     num_params = sum(p.numel() for p in diffusion.parameters())
     print(f'Model parameters: {num_params:,}')
-
     return diffusion
 
 
@@ -387,17 +538,54 @@ def save_checkpoint(path, model, ema, optimizer, scaler, iteration, args):
     print(f'Saved checkpoint: {path}')
 
 
-def load_checkpoint(path, model, ema=None, optimizer=None, scaler=None):
+def _load_compatible_state(module, state_dict, label):
+    current = module.state_dict()
+    compatible = {}
+    skipped = []
+    for key, value in state_dict.items():
+        if key in current and current[key].shape == value.shape:
+            compatible[key] = value
+        else:
+            skipped.append(key)
+
+    result = module.load_state_dict(compatible, strict=False)
+    print(
+        f'{label}: loaded {len(compatible)} tensors, '
+        f'skipped {len(skipped)}, missing {len(result.missing_keys)}')
+    if skipped:
+        print(
+            f'  Incompatible keys (first 8): '
+            f'{", ".join(skipped[:8])}')
+    return skipped
+
+
+def load_checkpoint(
+        path,
+        model,
+        ema=None,
+        optimizer=None,
+        scaler=None,
+        resume_weights_only=False):
     state = torch.load(path, map_location='cpu', weights_only=False)
-    model.load_state_dict(state['model'])
+    _load_compatible_state(model, state['model'], 'Model')
+
     if ema is not None and 'ema' in state:
         ema.load_state_dict(state['ema'])
-    if optimizer is not None and 'optimizer' in state:
-        optimizer.load_state_dict(state['optimizer'])
-    if scaler is not None and 'scaler' in state:
-        scaler.load_state_dict(state['scaler'])
-    iteration = state.get('iteration', 0)
-    print(f'Resumed from {path}, iteration {iteration}')
+
+    if not resume_weights_only:
+        if optimizer is not None and 'optimizer' in state:
+            try:
+                optimizer.load_state_dict(state['optimizer'])
+            except ValueError as error:
+                print(
+                    'WARNING: optimizer state is incompatible with the '
+                    f'updated architecture and was not loaded: {error}')
+        if scaler is not None and 'scaler' in state:
+            scaler.load_state_dict(state['scaler'])
+
+    iteration = 0 if resume_weights_only else state.get('iteration', 0)
+    mode = 'weights only' if resume_weights_only else 'full state'
+    print(f'Resumed {mode} from {path}, iteration {iteration}')
     return iteration
 
 
@@ -411,6 +599,23 @@ def _normalize_slice(img):
     if vmax - vmin > 1e-8:
         return (img - vmin) / (vmax - vmin)
     return np.zeros_like(img)
+
+
+def _periodic_boundary_ratio(volume, period):
+    """Measure gradient energy at periodic patch borders versus elsewhere."""
+    ratios = []
+    for axis in range(3):
+        gradient = np.abs(np.diff(volume, axis=axis))
+        indices = np.arange(gradient.shape[axis])
+        boundary = (indices + 1) % period == 0
+        if not boundary.any() or boundary.all():
+            continue
+        boundary_mean = np.take(
+            gradient, indices[boundary], axis=axis).mean()
+        interior_mean = np.take(
+            gradient, indices[~boundary], axis=axis).mean()
+        ratios.append(float(boundary_mean / max(interior_mean, 1e-12)))
+    return float(np.mean(ratios)) if ratios else 1.0
 
 
 class TrainLogger:
@@ -483,7 +688,10 @@ def run_inference(model, device, args, iteration, out_dir, logger=None):
     os.makedirs(out_dir, exist_ok=True)
 
     ages = [0.0, 0.25, 0.5, 0.75, 1.0]  # normalized
-    age_real = [a * 80 + 6 for a in ages]
+    age_real = [
+        a * (args.resolved_age_max - args.resolved_age_min)
+        + args.resolved_age_min
+        for a in ages]
 
     vol_shape = (1, args.volume_size, args.volume_size, args.volume_size)
     seed = 42
@@ -501,8 +709,9 @@ def run_inference(model, device, args, iteration, out_dir, logger=None):
             test_cfg_override=dict(
                 sampler='FlowEulerODE',
                 output_mode='mean',
-                num_timesteps=16,
-                num_substeps=4))
+                num_timesteps=args.sample_timesteps,
+                num_substeps=args.sample_substeps,
+                order=args.sample_order))
 
         vol_np = output[0].cpu().numpy()  # (1, D, H, W)
         fname = f'iter{iteration:07d}_age{age_yr:.0f}.npy'
@@ -517,6 +726,13 @@ def run_inference(model, device, args, iteration, out_dir, logger=None):
             sagittal = _normalize_slice(vol[:, :, w // 2])
 
             tag = f'samples/age_{age_yr:.0f}yr'
+            boundary_period = args.patch_size * (
+                2 if args.use_wavelet else 1)
+            boundary_ratio = _periodic_boundary_ratio(
+                vol, boundary_period)
+            logger.log_scalars(
+                {f'{tag}/patch_boundary_ratio': boundary_ratio},
+                iteration)
             logger.log_image(f'{tag}/axial', axial, iteration,
                              caption=f'age={age_yr:.0f} axial')
             logger.log_image(f'{tag}/coronal', coronal, iteration,
@@ -538,12 +754,29 @@ def train(args):
         print(f'GPU: {torch.cuda.get_device_name()}')
         print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
 
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(args.seed)
+        torch.set_float32_matmul_precision('high')
+
     # Dataset
-    dataset = OpenBHBSimple(
+    dataset = OpenBHBStandaloneDataset(
         cache_dir=args.cache_dir,
+        data_root=args.data_root,
         metadata_path=args.metadata,
+        volume_size=args.volume_size,
+        npy_suffix=args.npy_suffix,
+        age_min=args.age_min,
+        age_max=args.age_max,
         random_flip=True,
         split=args.split)
+    args.resolved_age_min = dataset.age_min
+    args.resolved_age_max = dataset.age_max
+    if args.batch_size > len(dataset):
+        raise ValueError(
+            f'Batch size {args.batch_size} exceeds dataset size '
+            f'{len(dataset)} while drop_last=True')
 
     dataloader = DataLoader(
         dataset,
@@ -571,12 +804,18 @@ def train(args):
     # AMP scaler
     use_amp = args.autocast_dtype is not None and device.type == 'cuda'
     autocast_dtype = getattr(torch, args.autocast_dtype) if args.autocast_dtype else None
-    scaler = torch.amp.GradScaler('cuda') if (use_amp and autocast_dtype == torch.float16) else None
+    scaler = torch.cuda.amp.GradScaler() if (use_amp and autocast_dtype == torch.float16) else None
 
     # Resume
     start_iter = 0
     if args.resume:
-        start_iter = load_checkpoint(args.resume, model, ema, optimizer, scaler)
+        start_iter = load_checkpoint(
+            args.resume,
+            model,
+            ema,
+            optimizer,
+            scaler,
+            resume_weights_only=args.resume_weights_only)
 
     # LR warmup
     def get_lr(iteration):
@@ -609,6 +848,13 @@ def train(args):
     print(f'  AMP: {args.autocast_dtype or "disabled"}')
     print(f'  EMA: {"enabled" if args.use_ema else "disabled"}')
     print(f'  Checkpointing: {"enabled" if args.checkpointing else "disabled"}')
+    print(f'  Wavelet: {"enabled" if args.use_wavelet else "disabled"}')
+    print(
+        f'  Sampler: order {args.sample_order}, '
+        f'{args.sample_timesteps} x {args.sample_substeps} steps')
+    print(
+        f'  Age range: [{args.resolved_age_min:g}, '
+        f'{args.resolved_age_max:g}] years')
     print(f'  Loggers: {", ".join(args.logger)}')
     print()
 
@@ -731,72 +977,182 @@ def train(args):
 def main():
     parser = argparse.ArgumentParser(description='Standalone GMFlow3D training')
 
+    default_root = os.environ.get(
+        'OPENBHB_ROOT',
+        '/media/fred/FRED5TB/Einstein/Open_BHB_processado')
+
     # Data
-    parser.add_argument('--cache_dir', type=str, required=True,
-                        help='Directory with preprocessed .pt volumes')
-    parser.add_argument('--metadata', type=str, required=True,
-                        help='Path to metadata.tsv or train.tsv')
-    parser.add_argument('--split', type=str, default=None,
-                        help='Filter by split column (e.g. "train"). '
-                             'Only needed when metadata has a split column.')
+    parser.add_argument(
+        '--cache_dir',
+        type=str,
+        default=os.environ.get('OPENBHB_CACHE_DIR'),
+        help='Optional directory with prepared .pt volumes')
+    parser.add_argument(
+        '--data_root',
+        type=str,
+        default=os.environ.get(
+            'OPENBHB_DATA_ROOT',
+            os.path.join(default_root, 'train', 'quasiraw_3d')),
+        help='Directory with raw/preprocessed OpenBHB .npy volumes')
+    parser.add_argument(
+        '--metadata',
+        type=str,
+        default=os.environ.get(
+            'OPENBHB_METADATA',
+            os.path.join(default_root, 'train.tsv')),
+        help='Path to metadata.tsv or train.tsv')
+    parser.add_argument('--npy_suffix', type=str, default='_quasiraw_3d')
+    parser.add_argument('--split', type=str, default=None)
+    parser.add_argument('--age_min', type=float, default=None)
+    parser.add_argument('--age_max', type=float, default=None)
 
     # Model architecture
     parser.add_argument('--num_gaussians', type=int, default=4)
     parser.add_argument('--num_heads', type=int, default=12)
-    parser.add_argument('--head_dim', type=int, default=64,
-                        help='inner_dim = num_heads * head_dim (default: 768)')
+    parser.add_argument('--head_dim', type=int, default=64)
     parser.add_argument('--num_layers', type=int, default=12)
     parser.add_argument('--volume_size', type=int, default=64)
-    parser.add_argument('--patch_size', type=int, default=4)
-    parser.add_argument('--age_dropout_prob', type=float, default=0.1)
-    parser.add_argument('--checkpointing', action='store_true', default=True,
-                        help='Enable gradient checkpointing')
-    parser.add_argument('--no_checkpointing', action='store_false', dest='checkpointing')
+    parser.add_argument('--patch_size', type=int, default=2)
+    parser.add_argument('--age_dropout_prob', type=float, default=0.0)
+    parser.add_argument('--age_fourier_frequencies', type=int, default=8)
+
+    parser.add_argument(
+        '--use_wavelet', action='store_true', default=True,
+        help='Train in one-level 3D Haar space (default)')
+    parser.add_argument(
+        '--no_wavelet', action='store_false', dest='use_wavelet')
+
+    parser.add_argument(
+        '--overlap_patch_embed', action='store_true', default=True,
+        help='Use overlapping Conv3d patch embedding (default)')
+    parser.add_argument(
+        '--no_overlap_patch_embed',
+        action='store_false',
+        dest='overlap_patch_embed')
+
+    parser.add_argument(
+        '--local_refinement', action='store_true', default=True,
+        help='Enable zero-initialized local mixture-mean refinement (default)')
+    parser.add_argument(
+        '--no_local_refinement',
+        action='store_false',
+        dest='local_refinement')
+    parser.add_argument('--refinement_hidden_channels', type=int, default=64)
+    parser.add_argument('--refinement_num_layers', type=int, default=2)
+
+    parser.add_argument(
+        '--per_channel_logstd', action='store_true', default=True,
+        help='Use independent variance per wavelet subband (default)')
+    parser.add_argument(
+        '--global_logstd',
+        action='store_false',
+        dest='per_channel_logstd')
+
+    parser.add_argument(
+        '--checkpointing', action='store_true', default=True)
+    parser.add_argument(
+        '--no_checkpointing',
+        action='store_false',
+        dest='checkpointing')
+
+    # Loss and flow path
+    parser.add_argument('--mixture_mean_weight', type=float, default=0.05)
+    parser.add_argument('--voxel_gradient_weight', type=float, default=0.25)
+    parser.add_argument('--boundary_period', type=int, default=None)
+    parser.add_argument('--boundary_weight', type=float, default=2.0)
+    parser.add_argument(
+        '--randomize_trans_ratio', action='store_true', default=True)
+    parser.add_argument(
+        '--fixed_trans_ratio',
+        action='store_false',
+        dest='randomize_trans_ratio')
+    parser.add_argument('--trans_ratio_min', type=float, default=0.05)
+    parser.add_argument('--trans_ratio_max', type=float, default=1.0)
 
     # Training
     parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--grad_accum', type=int, default=4,
-                        help='Gradient accumulation steps')
+    parser.add_argument('--grad_accum', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=0.05)
     parser.add_argument('--grad_clip', type=float, default=10.0)
     parser.add_argument('--warmup_iters', type=int, default=1000)
     parser.add_argument('--total_iters', type=int, default=100000)
-    parser.add_argument('--prob_age', type=float, default=0.9,
-                        help='Probability of using real age (1-p = unconditional for CFG)')
-    parser.add_argument('--autocast_dtype', type=str, default='bfloat16',
-                        choices=['bfloat16', 'float16', None],
-                        help='AMP dtype (None to disable)')
-    parser.add_argument('--no_amp', action='store_const', const=None, dest='autocast_dtype')
+    parser.add_argument('--prob_age', type=float, default=0.9)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument(
+        '--autocast_dtype',
+        type=str,
+        default='bfloat16',
+        choices=['bfloat16', 'float16'])
+    parser.add_argument(
+        '--no_amp',
+        action='store_const',
+        const=None,
+        dest='autocast_dtype')
 
-    # EMA
+    # EMA and sampling
     parser.add_argument('--use_ema', action='store_true', default=True)
     parser.add_argument('--no_ema', action='store_false', dest='use_ema')
     parser.add_argument('--ema_decay', type=float, default=0.9999)
+    parser.add_argument('--sample_timesteps', type=int, default=25)
+    parser.add_argument('--sample_substeps', type=int, default=4)
+    parser.add_argument('--sample_order', type=int, choices=[1, 2], default=2)
 
     # I/O
-    parser.add_argument('--work_dir', type=str, default='work_dirs/gmflow3d_standalone')
+    parser.add_argument(
+        '--work_dir',
+        type=str,
+        default='work_dirs/gmflow3d_standalone')
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--log_interval', type=int, default=10)
     parser.add_argument('--save_interval', type=int, default=5000)
     parser.add_argument('--sample_interval', type=int, default=5000)
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint to resume from')
+    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument(
+        '--resume_weights_only',
+        action='store_true',
+        help='Load compatible model/EMA tensors and restart optimizer/iteration')
 
     # Logging
-    parser.add_argument('--logger', type=str, nargs='+',
-                        default=['tensorboard'],
-                        choices=['tensorboard', 'wandb'],
-                        help='Logging backends (default: tensorboard). '
-                             'Use --logger tensorboard wandb for both.')
-    parser.add_argument('--wandb_project', type=str, default='gmflow3d',
-                        help='W&B project name')
-    parser.add_argument('--wandb_name', type=str, default=None,
-                        help='W&B run name (auto-generated if not set)')
-    parser.add_argument('--wandb_entity', type=str, default=None,
-                        help='W&B team/entity name')
+    parser.add_argument(
+        '--logger',
+        type=str,
+        nargs='+',
+        default=['tensorboard'],
+        choices=['tensorboard', 'wandb'])
+    parser.add_argument('--wandb_project', type=str, default='gmflow3d')
+    parser.add_argument('--wandb_name', type=str, default=None)
+    parser.add_argument('--wandb_entity', type=str, default=None)
 
     args = parser.parse_args()
+
+    if not os.path.isfile(args.metadata):
+        parser.error(f'Metadata file does not exist: {args.metadata}')
+    if args.cache_dir is not None and not os.path.isdir(args.cache_dir):
+        print(
+            f'WARNING: cache directory does not exist; using .npy files: '
+            f'{args.cache_dir}')
+        args.cache_dir = None
+    if args.data_root is not None and not os.path.isdir(args.data_root):
+        if args.cache_dir is None:
+            parser.error(f'Data root does not exist: {args.data_root}')
+        args.data_root = None
+    if args.use_wavelet and args.volume_size % 2 != 0:
+        parser.error('--use_wavelet requires an even --volume_size')
+
+    model_volume_size = (
+        args.volume_size // 2 if args.use_wavelet else args.volume_size)
+    if model_volume_size % args.patch_size != 0:
+        parser.error(
+            'Model-space volume size must be divisible by --patch_size')
+    if not 0 <= args.prob_age <= 1:
+        parser.error('--prob_age must be in [0, 1]')
+    if not 0 < args.trans_ratio_min <= args.trans_ratio_max <= 1:
+        parser.error(
+            'Transition ratio bounds must satisfy 0 < min <= max <= 1')
+    if args.mixture_mean_weight < 0 or args.voxel_gradient_weight < 0:
+        parser.error('Auxiliary loss weights must be non-negative')
+
     train(args)
 
 

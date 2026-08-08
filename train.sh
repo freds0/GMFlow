@@ -6,9 +6,12 @@ set -euo pipefail
 # Override these from the shell or SLURM, for example:
 #   DATA_DIR=/datasets/openbhb GPUS=4 ./train.sh
 # CLI flags below override both these defaults and exported environment values.
-DATA_DIR="${DATA_DIR:-data/openbhb}"
+OPENBHB_ROOT="${OPENBHB_ROOT:-/media/fred/FRED5TB/Einstein/Open_BHB_processado}"
+DATA_DIR="${DATA_DIR:-${OPENBHB_DATA_ROOT:-${OPENBHB_ROOT}/train/quasiraw_3d}}"
+METADATA_PATH="${METADATA_PATH:-${OPENBHB_METADATA:-${OPENBHB_ROOT}/train.tsv}}"
+CACHE_DIR="${CACHE_DIR:-${OPENBHB_CACHE_DIR:-}}"
 OUTPUT_DIR="${OUTPUT_DIR:-work_dirs}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 EPOCHS="${EPOCHS:-100}"
 GPUS="${GPUS:-1}"
@@ -25,15 +28,18 @@ usage() {
 Usage: ./train.sh [options]
 
 Options:
-  --data_dir PATH              Dataset directory verified before launch.
+  --data_dir PATH              Directory with OpenBHB quasiraw .npy files.
+  --metadata PATH              OpenBHB metadata TSV.
+  --cache_dir PATH             Optional directory with prepared .pt volumes.
   --output_dir PATH            Directory for checkpoints/logs.
-  --batch_size N               Exported as BATCH_SIZE. Default: 32.
+  --batch_size N               Exported as BATCH_SIZE. Default: 2.
   --learning_rate LR           Exported as LEARNING_RATE. Default: 1e-4.
   --epochs N                   Exported as EPOCHS. Default: 100.
   --gpus N                     Number of GPUs to expose when CUDA_VISIBLE_DEVICES is unset.
   --cuda_visible_devices LIST  Explicit CUDA_VISIBLE_DEVICES, e.g. 0,1,2,3.
   --model_config PATH          Training config passed as positional train.py argument.
-  --resume_from PATH           Checkpoint path passed to train.py.
+  --resume PATH                Continue training from this checkpoint.
+  --resume_from PATH           Alias for --resume.
   --seed N                     Random seed passed to train.py.
   --no_validate                Disable validation.
   --deterministic              Enable deterministic CUDNN behavior.
@@ -44,6 +50,7 @@ Examples:
   ./train.sh --batch_size 64 --gpus 4
   DATA_DIR=/scratch/openbhb OUTPUT_DIR=/scratch/runs ./train.sh --dry-run
   CUDA_VISIBLE_DEVICES=2,3 ./train.sh --gpus 2
+  ./train.sh --resume checkpoints/gmflow3d_openbhb_k4/latest.pth
 
 Notes:
   This repository's train.py accepts: config, --work-dir, --resume-from,
@@ -93,6 +100,16 @@ while [[ $# -gt 0 ]]; do
             DATA_DIR="$2"
             shift 2
             ;;
+        --metadata)
+            require_value "$1" "${2-}"
+            METADATA_PATH="$2"
+            shift 2
+            ;;
+        --cache_dir)
+            require_value "$1" "${2-}"
+            CACHE_DIR="$2"
+            shift 2
+            ;;
         --output_dir)
             require_value "$1" "${2-}"
             OUTPUT_DIR="$2"
@@ -128,7 +145,7 @@ while [[ $# -gt 0 ]]; do
             MODEL_CONFIG="$2"
             shift 2
             ;;
-        --resume_from)
+        --resume|--resume_from)
             require_value "$1" "${2-}"
             RESUME_FROM="$2"
             shift 2
@@ -167,6 +184,10 @@ is_positive_int "$EPOCHS" || die "EPOCHS must be a positive integer: $EPOCHS"
 is_positive_int "$GPUS" || die "GPUS must be a positive integer: $GPUS"
 
 [[ -d "$DATA_DIR" ]] || die "DATA_DIR does not exist: $DATA_DIR"
+[[ -f "$METADATA_PATH" ]] || die "METADATA_PATH does not exist: $METADATA_PATH"
+if [[ -n "$CACHE_DIR" && ! -d "$CACHE_DIR" ]]; then
+    die "CACHE_DIR does not exist: $CACHE_DIR"
+fi
 [[ -f "$MODEL_CONFIG" ]] || die "MODEL_CONFIG does not exist: $MODEL_CONFIG"
 mkdir -p "$OUTPUT_DIR"
 
@@ -175,6 +196,14 @@ if [[ -z "$CUDA_VISIBLE_DEVICES" ]]; then
 fi
 
 export DATA_DIR OUTPUT_DIR BATCH_SIZE LEARNING_RATE EPOCHS GPUS CUDA_VISIBLE_DEVICES
+export OPENBHB_ROOT
+export OPENBHB_DATA_ROOT="$DATA_DIR"
+export OPENBHB_METADATA="$METADATA_PATH"
+if [[ -n "$CACHE_DIR" ]]; then
+    export OPENBHB_CACHE_DIR="$CACHE_DIR"
+else
+    unset OPENBHB_CACHE_DIR
+fi
 
 CMD=(
     python train.py

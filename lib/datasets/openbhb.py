@@ -71,16 +71,23 @@ class OpenBHB(Dataset):
             for _, row in metadata.iterrows():
                 participant_id = str(row['participant_id'])
                 age = float(row['age'])
-                if self.use_cache:
-                    vol_path = os.path.join(cache_dir, f'{participant_id}.pt')
+                cache_path = os.path.join(cache_dir, f'{participant_id}.pt')
+                raw_path = os.path.join(
+                    data_root, f'{participant_id}{npy_suffix}.npy')
+                if self.use_cache and os.path.exists(cache_path):
+                    vol_path = cache_path
+                elif os.path.exists(raw_path):
+                    vol_path = raw_path
                 else:
-                    vol_path = os.path.join(
-                        data_root, f'{participant_id}{npy_suffix}.npy')
-                if os.path.exists(vol_path):
+                    vol_path = None
+
+                if vol_path is not None:
                     self.subjects.append(dict(
                         participant_id=participant_id,
                         age=age,
-                        path=vol_path))
+                        path=vol_path,
+                        cache_path=cache_path,
+                        raw_path=raw_path))
 
             logger = get_root_logger()
             mmcv.print_log(f'OpenBHB data root: {self.data_root}', logger=logger)
@@ -100,15 +107,19 @@ class OpenBHB(Dataset):
         return vol
 
     def _load_and_preprocess(self, path):
-        """Load a raw .npy volume and downsample to target_shape."""
+        """Load a raw .npy volume and downsample to target_shape.
+
+        Normalization is applied centrally in ``__getitem__`` so that the
+        cached and on-the-fly paths share the exact same intensity statistics.
+        """
         vol = np.load(path).astype(np.float32)
         vol = torch.from_numpy(vol).unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
         vol = F.interpolate(vol, size=self.target_shape, mode='trilinear', align_corners=False)
         vol = vol.squeeze(0)  # (1, D, H, W)
-        return self._normalize_volume(vol)
+        return vol
 
     def _load_cached(self, path):
-        """Load a preprocessed .pt volume."""
+        """Load a preprocessed .pt volume (normalized centrally in __getitem__)."""
         return torch.load(path, weights_only=True)
 
     def _normalize_age(self, age):
@@ -130,10 +141,15 @@ class OpenBHB(Dataset):
 
         subject = self.subjects[idx]
 
-        if self.use_cache:
+        if self.use_cache and subject['path'].endswith('.pt'):
             vol = self._load_cached(subject['path'])
         else:
             vol = self._load_and_preprocess(subject['path'])
+
+        # Normalize centrally so cached (.pt) and on-the-fly (.npy) paths are
+        # identically distributed. Z-score is invariant to affine rescaling, so
+        # a cache stored in [0, 1] and a raw volume yield the same result here.
+        vol = self._normalize_volume(vol)
 
         # Random left-right flip (sagital axis, last dim = W)
         if self.random_flip and np.random.rand() < 0.5:

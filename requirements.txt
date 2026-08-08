@@ -1,14 +1,37 @@
-git+https://github.com/open-mmlab/mmcv.git@d409eedc816fccfb1c8d57e5eed5f03bd075f327
-git+https://github.com/Lakonik/mmgeneration.git@500a93e474638c87dcaf8fad94cfbe1ef29acd1f
-git+https://github.com/huggingface/diffusers.git@57084dacc5275d7212513b24837b60a28e55603d
-transformers
+# Tested dependency set for the 3D GMFlow/OpenBHB pipeline.
+#
+# Install PyTorch first, then this file:
+#   python -m pip install torch==2.0.1 torchvision==0.15.2 \
+#     --index-url https://download.pytorch.org/whl/cu118
+#   python -m pip install -r requirements.txt
+#
+# mmgeneration is installed separately as an editable local dependency; see README.
+
+-f https://download.openmmlab.com/mmcv/dist/cu118/torch2.0/index.html
+
+numpy<2
+setuptools<70
+wheel
+
+mmcv-full==1.7.2
+# diffusers 0.27.2 lacks DiTTransformer2DModel; the code needs the pinned commit.
+diffusers @ git+https://github.com/huggingface/diffusers.git@57084dacc5275d7212513b24837b60a28e55603d
+# Verified-compatible HF trio for the pinned diffusers (cached_download removed in hub>=0.26).
+transformers==4.39.3
+accelerate==0.29.3
+huggingface-hub==0.22.2
 torchsde
 tensorboard
 wandb
-setuptools
-apex==0.9.10dev
-bitsandbytes
-yapf==0.40.1
 pandas
-diffusers
+scipy
 matplotlib
+nibabel
+tqdm
+einops
+yapf==0.40.1
+opencv-python<4.12
+
+# Optional: only install bitsandbytes when CUDA runtime libraries are available.
+# The repository falls back to torch.optim.AdamW if bitsandbytes cannot import.
+# bitsandbytes
